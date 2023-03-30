@@ -33,7 +33,7 @@ class WrapperLogFormatter(ColoredFormatter):
 
 def get_logger(
     name: str,
-    level: int = logging.INFO,
+    level: int or str = logging.INFO,
     filename: str = None,
     console: bool = True,
     file_max_bytes: int = 104857600,
@@ -44,7 +44,7 @@ def get_logger(
 
     Args:
         name (str):): name of the logger
-        level (int): level of logging
+        level (int or str): level of logging
         filename (str): filename (full path) for log file
         console (bool): whether to log to console
         file_max_bytes (int): log file size max size in bytes
@@ -56,6 +56,9 @@ def get_logger(
     """
     if LOGGERS.get(name):
         return LOGGERS.get(name)
+
+    if level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+        raise ValueError(f"Invalid log level: {level}")
 
     logger_obj = logging.getLogger(name)
     log_formatter = WrapperLogFormatter(
