@@ -4,7 +4,7 @@ A simple logger for console/file logging with duplicate logs filter support
 
 ## Release new version
 
-### requirements:
+### requirements
 
 * Export GitHub token
 
@@ -19,7 +19,7 @@ sudo npm install --global release-it
 npm install --save-dev @release-it/bumper
 ```
 
-### usage:
+### usage
 
 * Create a release
 
