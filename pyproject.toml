@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "python-simple-logger"
+version = "1.0.0"
+description = "A simple logger for python"
+authors = ["Meni Yakove <myakove@gmail.com>"]
+readme = "README.md"
+packages = [{include = "simple_logger"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+colorlog = "^6.7.0"
+
+[tool.poetry.group.dev.dependencies]
+ipdb = "^0.13.13"
+ipython = "^8.12.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.flake8]
+max-line-length = 120
+exclude = ["doc", ".tox", ".git", ".yml", "docs/*", ".cache/*"]
+enable-extensions = ["FCN"]
