@@ -33,8 +33,8 @@ class WrapperLogFormatter(ColoredFormatter):
 
 def get_logger(
     name: str,
-    level: int,
-    filename: str,
+    level: int = logging.INFO,
+    filename: str = None,
     console: bool = True,
     file_max_bytes: int = 104857600,
     file_backup_count: int = 20,
