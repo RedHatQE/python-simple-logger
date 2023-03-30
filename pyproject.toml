@@ -17,8 +17,3 @@ ipython = "^8.12.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
-
-[tool.flake8]
-max-line-length = 120
-exclude = ["doc", ".tox", ".git", ".yml", "docs/*", ".cache/*"]
-enable-extensions = ["FCN"]
