@@ -57,9 +57,6 @@ def get_logger(
     if LOGGERS.get(name):
         return LOGGERS.get(name)
 
-    if level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
-        raise ValueError(f"Invalid log level: {level}")
-
     logger_obj = logging.getLogger(name)
     log_formatter = WrapperLogFormatter(
         fmt="%(asctime)s %(name)s %(log_color)s%(levelname)s%(reset)s %(message)s",
