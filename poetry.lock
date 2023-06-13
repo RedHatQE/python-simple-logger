@@ -1116,14 +1116,14 @@ files = [
 
 [[package]]
 name = "poetry-dynamic-versioning"
-version = "0.22.0"
+version = "0.23.0"
 description = "Plugin for Poetry to enable dynamic versioning based on VCS tags"
 category = "main"
 optional = false
 python-versions = ">=3.7,<4.0"
 files = [
-    {file = "poetry_dynamic_versioning-0.22.0-py3-none-any.whl", hash = "sha256:4864371c930e5d9a8144a9457c5a49c32cc44efd2370242721cb0240e8a9bf0e"},
-    {file = "poetry_dynamic_versioning-0.22.0.tar.gz", hash = "sha256:f148b77337821a8e1c24a78ad98326d2189da0b84b76572b8d011fc4218e9ac1"},
+    {file = "poetry_dynamic_versioning-0.23.0-py3-none-any.whl", hash = "sha256:764be34df672f57f5000dd800110a21dc42bcd9ab0f5492a37bd4f0265ee521d"},
+    {file = "poetry_dynamic_versioning-0.23.0.tar.gz", hash = "sha256:c540fde6e9e334ec3b0f14f57f8467076d8d76ed0d503a89db9f91e59fd5d6f9"},
 ]
 
 [package.dependencies]
@@ -1199,7 +1199,7 @@ version = "2.21"
 description = "C parser in Python"
 category = "main"
 optional = false
-python-versions = "*"
+python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*"
 files = [
     {file = "pycparser-2.21-py2.py3-none-any.whl", hash = "sha256:8ee45429555515e1f6b185e78100aea234072576aa43ab53aefcae078162fca9"},
     {file = "pycparser-2.21.tar.gz", hash = "sha256:e644fdec12f7872f86c58ff790da456218b10f863970249516d60a5eaca77206"},
@@ -1734,4 +1734,4 @@ testing = ["big-O", "flake8 (<5)", "jaraco.functools", "jaraco.itertools", "more
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.8"
-content-hash = "4a6aa4ddc88e92dc4f145b2162ce702001bd3e92984b936a9e2936f9c8d6e94a"
+content-hash = "1f112df4294688390df04683cd8b6173f3abc5d0060ac14e0abcb55707609edd"
