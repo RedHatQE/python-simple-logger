@@ -20,7 +20,7 @@ profile = "black"
 name = "python-simple-logger"
 version = "0.0.0"
 description = "A simple logger for python"
-authors = ["Meni Yakove <myakove@gmail.com>"]
+authors = ["Meni Yakove <myakove@gmail.com>", "Ruth Netser <rnetser@gmail.com>"]
 readme = "README.md"
 license = "Apache-2.0"
 packages = [{include = "simple_logger"}]
