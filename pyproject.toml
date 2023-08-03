@@ -34,7 +34,6 @@ classifiers = [
 [tool.poetry.dependencies]
 python = "^3.8"
 colorlog = "^6.7.0"
-poetry-dynamic-versioning = {extras = ["plugin"], version = "^0.25.0"}
 
 [tool.poetry.group.dev.dependencies]
 ipdb = "^0.13.13"
