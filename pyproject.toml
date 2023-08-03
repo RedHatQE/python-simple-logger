@@ -1,10 +1,35 @@
+[tool.black]
+line-length = 88
+target_version = ['py38', 'py39', 'py310', "py311"]
+exclude = '''
+(
+  /(
+    | \.git
+    | \.venv
+    | \.mypy_cache
+    | \.tox
+  )/
+)
+'''
+
+[tool.isort]
+line_length = 88
+profile = "black"
+
 [tool.poetry]
 name = "python-simple-logger"
-version = "1.0.0"
+version = "0.0.0"
 description = "A simple logger for python"
-authors = ["Meni Yakove <myakove@gmail.com>"]
+authors = ["Meni Yakove <myakove@gmail.com>", "Ruth Netser <rnetser@gmail.com>"]
 readme = "README.md"
+license = "Apache-2.0"
 packages = [{include = "simple_logger"}]
+homepage = "https://github.com/RedHatQE/python-simple-logger"
+documentation = "https://github.com/RedHatQE/python-simple-logger/blob/main/README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
 
 [tool.poetry.dependencies]
 python = "^3.8"
@@ -12,7 +37,15 @@ colorlog = "^6.7.0"
 
 [tool.poetry.group.dev.dependencies]
 ipdb = "^0.13.13"
-ipython = "^8.12.0"
+ipython = "*"
+
+[tool.poetry.urls]
+Download = "https://pypi.org/project/python-simple-logger/"
+"Bug Tracker" = "https://github.com/RedHatQE/python-simple-logger/issues"
+
+[tool.poetry.group.tests.dependencies]
+pytest = "^7.4.0"
+requests = "^2.31.0"
 
 [tool.poetry-dynamic-versioning]
 enable = true
