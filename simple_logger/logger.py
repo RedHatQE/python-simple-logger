@@ -57,7 +57,7 @@ def get_logger(
     if LOGGERS.get(name):
         return LOGGERS.get(name)
 
-    logging.SUCCESS = 32  # positive yet important
+    logging.SUCCESS = 32
     logging.addLevelName(logging.SUCCESS, "SUCCESS")
     logger_obj = logging.getLogger(name)
     logger_obj.success = lambda msg, *args: logger_obj._log(logging.SUCCESS, msg, args)
