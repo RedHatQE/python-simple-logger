@@ -12,6 +12,3 @@ exclude =
 
 fcn_exclude_functions:
     logging,
-
-enable-extensions =
-    FCN,
