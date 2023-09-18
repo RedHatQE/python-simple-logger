@@ -57,13 +57,17 @@ def get_logger(
     if LOGGERS.get(name):
         return LOGGERS.get(name)
 
+    logging.SUCCESS = 32  # positive yet important
+    logging.addLevelName(logging.SUCCESS, "SUCCESS")
     logger_obj = logging.getLogger(name)
+    logger_obj.success = lambda msg, *args: logger_obj._log(logging.SUCCESS, msg, args)
     log_formatter = WrapperLogFormatter(
         fmt="%(asctime)s %(name)s %(log_color)s%(levelname)s%(reset)s %(message)s",
         log_colors={
             "DEBUG": "cyan",
             "INFO": "green",
             "WARNING": "yellow",
+            "SUCCESS": "bold_green",
             "ERROR": "red",
             "CRITICAL": "red,bg_white",
         },
