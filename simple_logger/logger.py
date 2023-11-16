@@ -85,9 +85,7 @@ def get_logger(
     logger_obj.addFilter(filter=DuplicateFilter())
 
     if filename:
-        log_handler = RotatingFileHandler(
-            filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count
-        )
+        log_handler = RotatingFileHandler(filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count)
         log_handler.setFormatter(fmt=log_formatter)
         log_handler.setLevel(level=level)
         logger_obj.addHandler(hdlr=log_handler)
