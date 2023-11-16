@@ -1,14 +1,17 @@
 [flake8]
-
-max-line-length = 120
+select=FCN,M511
 
 exclude =
     doc,
     .tox,
     .git,
     .yml,
+    Pipfile.*,
     docs/*,
     .cache/*
 
-fcn_exclude_functions:
+fcn_exclude_functions =
     logging,
+
+enable-extensions =
+    FCN,
