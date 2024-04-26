@@ -7,6 +7,14 @@ output-format = "grouped"
 [tool.ruff.format]
 exclude = [".git", ".venv", ".mypy_cache", ".tox", "__pycache__"]
 
+[tool.mypy]
+show_error_codes = true
+warn_unused_ignores = true
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
 
 [tool.poetry]
 name = "python-simple-logger"
@@ -15,12 +23,12 @@ description = "A simple logger for python"
 authors = ["Meni Yakove <myakove@gmail.com>", "Ruth Netser <rnetser@gmail.com>"]
 readme = "README.md"
 license = "Apache-2.0"
-packages = [{include = "simple_logger"}]
+packages = [{ include = "simple_logger" }]
 homepage = "https://github.com/RedHatQE/python-simple-logger"
 documentation = "https://github.com/RedHatQE/python-simple-logger/blob/main/README.md"
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
 ]
 
 [tool.poetry.dependencies]

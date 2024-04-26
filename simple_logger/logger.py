@@ -1,16 +1,22 @@
+from __future__ import annotations
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from typing import Any, Dict
 
 from colorlog import ColoredFormatter
 
 LOGGER = logging.getLogger(__name__)
-LOGGERS = {}
+LOGGERS: Dict[str, logging.Logger] = {}
+SUCCESS: int = 32
+HASH: int = 33
 
 
 class DuplicateFilter(logging.Filter):
-    def filter(self, record):
-        repeated_number_exists = getattr(self, "repeated_number", None)
+    def filter(self, record: logging.LogRecord) -> bool:
+        self.repeated_number: int
+
+        repeated_number_exists: bool | None = getattr(self, "repeated_number", None)
         current_log = (record.module, record.levelno, record.msg)
         if current_log != getattr(self, "last_log", None):
             self.last_log = current_log
@@ -27,14 +33,34 @@ class DuplicateFilter(logging.Filter):
 
 
 class WrapperLogFormatter(ColoredFormatter):
-    def formatTime(self, record, datefmt=None):  # noqa: N802
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802
         return datetime.fromtimestamp(record.created).isoformat()
+
+
+class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
+    def __init__(self, name: str, level: int = logging.INFO) -> None:
+        super().__init__(name=name, level=level)
+
+        logging.addLevelName(SUCCESS, "SUCCESS")
+        logging.addLevelName(HASH, "HASH")
+
+    def success(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self.log(SUCCESS, msg, *args, **kwargs)
+
+    def hash(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        for arg in args:
+            msg = msg.replace(arg, "*****")
+        args = ()
+        self.log(HASH, msg, *args, **kwargs)
+
+
+logging.setLoggerClass(SimpleLogger)
 
 
 def get_logger(
     name: str,
-    level: int or str = logging.INFO,
-    filename: str = None,
+    level: int | str = logging.INFO,
+    filename: str | None = None,
     console: bool = True,
     file_max_bytes: int = 104857600,
     file_backup_count: int = 20,
@@ -55,12 +81,9 @@ def get_logger(
 
     """
     if LOGGERS.get(name):
-        return LOGGERS.get(name)
+        return LOGGERS[name]
 
-    logging.SUCCESS = 32
-    logging.addLevelName(logging.SUCCESS, "SUCCESS")
     logger_obj = logging.getLogger(name)
-    logger_obj.success = lambda msg, *args: logger_obj._log(logging.SUCCESS, msg, args)
     log_formatter = WrapperLogFormatter(
         fmt="%(asctime)s %(name)s %(log_color)s%(levelname)s%(reset)s %(message)s",
         log_colors={
@@ -70,6 +93,7 @@ def get_logger(
             "SUCCESS": "bold_green",
             "ERROR": "red",
             "CRITICAL": "red,bg_white",
+            "HASH": "bold_yellow",
         },
         secondary_log_colors={},
     )
