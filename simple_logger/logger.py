@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from colorlog import ColoredFormatter
 
@@ -48,9 +48,10 @@ class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
         self.log(SUCCESS, msg, *args, **kwargs)
 
     def hash(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        for arg in args:
-            msg = msg.replace(arg, "*****")
-        args = ()
+        to_hash: List[str] = kwargs.pop("hash", [])
+        for hash in to_hash:
+            msg = msg.replace(hash, "*****")
+
         self.log(HASH, msg, *args, **kwargs)
 
 
