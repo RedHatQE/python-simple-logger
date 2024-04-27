@@ -94,6 +94,8 @@ def get_logger(
         console (bool): whether to log to console
         file_max_bytes (int): log file size max size in bytes
         file_backup_count (int): max number of log files to keep
+        mask_sensitive (bool): whether to mask sensitive information
+        mask_sensitive_patterns (List[str]): list of patterns to mask
 
     Returns:
         Logger: logger object
