@@ -7,7 +7,6 @@ from typing import Any, Dict, List
 
 from colorlog import ColoredFormatter
 
-LOGGER = logging.getLogger(__name__)
 LOGGERS: Dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
@@ -17,20 +16,20 @@ class DuplicateFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         self.repeated_number: int
 
-        repeated_number_exists: bool | None = getattr(self, "repeated_number", None)
+        _repeated_number: int = getattr(self, "repeated_number", 0)
         current_log = (record.module, record.levelno, record.msg)
         if current_log != getattr(self, "last_log", None):
             self.last_log = current_log
-            if repeated_number_exists:
-                LOGGER.warning(f"Last log repeated {self.repeated_number} times.")
-
+            if _repeated_number > 1:
+                record.msg = f"Last log repeated {self.repeated_number} times."
             self.repeated_number = 0
             return True
-        if repeated_number_exists:
-            self.repeated_number += 1
         else:
-            self.repeated_number = 1
-        return False
+            self.repeated_number += 1
+            return False
+
+    def redact(self, msg: str) -> str:
+        return msg
 
 
 class RedactingFilter(logging.Filter):
@@ -44,7 +43,7 @@ class RedactingFilter(logging.Filter):
 
     def redact(self, msg: str) -> str:
         for pattern in self._patterns:
-            msg = re.sub(rf"({pattern}\W+[^\s+]+)", f"{pattern} {'*' * 5} ", msg, re.IGNORECASE)
+            msg = re.sub(rf"({pattern}\W+[^\s+]+)", f"{pattern} {'*' * 5} ", msg, flags=re.IGNORECASE)
         return msg
 
 
@@ -129,8 +128,7 @@ def get_logger(
     logger_obj.setLevel(level=level)
     logger_obj.addFilter(filter=DuplicateFilter())
     if mask_sensitive:
-        if not mask_sensitive_patterns:
-            mask_sensitive_patterns = ["password", "token", "apikey", "secret"]
+        mask_sensitive_patterns = mask_sensitive_patterns or ["password", "token", "apikey", "secret"]
         logger_obj.addFilter(filter=RedactingFilter(patterns=mask_sensitive_patterns))
 
     if filename:
