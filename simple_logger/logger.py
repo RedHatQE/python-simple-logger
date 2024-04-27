@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+import re
 from typing import Any, Dict, List
 
 from colorlog import ColoredFormatter
@@ -30,6 +31,21 @@ class DuplicateFilter(logging.Filter):
         else:
             self.repeated_number = 1
         return False
+
+
+class RedactingFilter(logging.Filter):
+    def __init__(self, patterns: List[str]):
+        super(RedactingFilter, self).__init__()
+        self._patterns = patterns
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self.redact(record.msg)
+        return True
+
+    def redact(self, msg: str) -> str:
+        for pattern in self._patterns:
+            msg = re.sub(rf"({pattern}\W+[^\s+]+)", f"{pattern} {'*' * 5} ", msg, re.IGNORECASE)
+        return msg
 
 
 class WrapperLogFormatter(ColoredFormatter):
@@ -65,6 +81,8 @@ def get_logger(
     console: bool = True,
     file_max_bytes: int = 104857600,
     file_backup_count: int = 20,
+    mask_sensitive: bool = False,
+    mask_sensitive_patterns: List[str] | None = None,
 ) -> logging.Logger:
     """
     Get logger object for logging.
@@ -108,6 +126,10 @@ def get_logger(
 
     logger_obj.setLevel(level=level)
     logger_obj.addFilter(filter=DuplicateFilter())
+    if mask_sensitive:
+        if not mask_sensitive_patterns:
+            mask_sensitive_patterns = ["password", "token", "apikey", "secret"]
+        logger_obj.addFilter(filter=RedactingFilter(patterns=mask_sensitive_patterns))
 
     if filename:
         log_handler = RotatingFileHandler(filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count)
@@ -118,3 +140,11 @@ def get_logger(
     logger_obj.propagate = False
     LOGGERS[name] = logger_obj
     return logger_obj
+
+
+if __name__ == "__main__":
+    _log = get_logger(name="test", mask_sensitive=True, mask_sensitive_patterns=["password", "token"])
+    _log.info("This is my password: pass123")
+    _log.info("This is my token tok456!")
+    _log.info("This is my apikey - api#$789")
+    _log.info("This is my secret -> sec1234abc")
