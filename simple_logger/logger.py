@@ -140,11 +140,3 @@ def get_logger(
     logger_obj.propagate = False
     LOGGERS[name] = logger_obj
     return logger_obj
-
-
-if __name__ == "__main__":
-    _log = get_logger(name="test", mask_sensitive=True, mask_sensitive_patterns=["password", "token"])
-    _log.info("This is my password: pass123")
-    _log.info("This is my token tok456!")
-    _log.info("This is my apikey - api#$789")
-    _log.info("This is my secret -> sec1234abc")
