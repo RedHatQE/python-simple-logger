@@ -1,1 +1,1 @@
-{"$schema": "https://docs.renovatebot.com/renovate-schema.json", "packageRules": [{"matchPackagePatterns": ["colorlog", "ipdb", "ipython", "pytest", "requests"], "groupName": "poetry-deps"}]}
+{"$schema": "https://docs.renovatebot.com/renovate-schema.json", "packageRules": [{"matchPackagePatterns": ["colorlog", "ipdb", "ipython", "pytest", "requests", "pytest-cov"], "groupName": "poetry-deps"}]}
