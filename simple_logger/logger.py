@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from colorlog import ColoredFormatter
 
@@ -15,13 +15,15 @@ HASH: int = 33
 class DuplicateFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         self.repeated_number: int
+        self.last_log: Tuple[str, int, str]
 
         _repeated_number: int = getattr(self, "repeated_number", 0)
         current_log = (record.module, record.levelno, record.msg)
         if current_log != getattr(self, "last_log", None):
-            self.last_log = current_log
             if _repeated_number > 1:
-                record.msg = f"Last log repeated {self.repeated_number} times."
+                record.msg = f"{record.msg} --- [DuplicateFilter: Last log `{self.last_log[-1]}` repeated {self.repeated_number} times]"
+
+            self.last_log = current_log
             self.repeated_number = 0
             return True
         else:
@@ -81,6 +83,7 @@ def get_logger(
     file_max_bytes: int = 104857600,
     file_backup_count: int = 20,
     mask_sensitive: bool = False,
+    duplicate_filter: bool = True,
     mask_sensitive_patterns: List[str] | None = None,
 ) -> logging.Logger:
     """
@@ -121,12 +124,15 @@ def get_logger(
     if console:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(fmt=log_formatter)
-        console_handler.addFilter(filter=DuplicateFilter())
+        if duplicate_filter:
+            console_handler.addFilter(filter=DuplicateFilter())
 
         logger_obj.addHandler(hdlr=console_handler)
 
     logger_obj.setLevel(level=level)
-    logger_obj.addFilter(filter=DuplicateFilter())
+    if duplicate_filter:
+        logger_obj.addFilter(filter=DuplicateFilter())
+
     if mask_sensitive:
         mask_sensitive_patterns = mask_sensitive_patterns or ["password", "token", "apikey", "secret"]
         logger_obj.addFilter(filter=RedactingFilter(patterns=mask_sensitive_patterns))
