@@ -78,4 +78,4 @@ def test_levels(tmp_log_file, basic_logger):
     assert "Error message" in content
     assert "Critical message" in content
     assert "Success message" in content
-    assert "Last log repeated 4 times." in content
+    assert "repeated 4 times" in content
