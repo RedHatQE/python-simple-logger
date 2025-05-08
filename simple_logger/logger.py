@@ -1,13 +1,14 @@
 from __future__ import annotations
+
 import logging
+import re
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-import re
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from colorlog import ColoredFormatter
 
-LOGGERS: Dict[str, logging.Logger] = {}
+LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
 
@@ -15,7 +16,7 @@ HASH: int = 33
 class DuplicateFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         self.repeated_number: int
-        self.last_log: Tuple[str, int, str]
+        self.last_log: tuple[str, int, str]
 
         _repeated_number: int = getattr(self, "repeated_number", 0)
         current_log = (record.module, record.levelno, record.msg)
@@ -35,7 +36,7 @@ class DuplicateFilter(logging.Filter):
 
 
 class RedactingFilter(logging.Filter):
-    def __init__(self, patterns: List[str]):
+    def __init__(self, patterns: list[str]):
         super(RedactingFilter, self).__init__()
         self._patterns = patterns
 
@@ -65,7 +66,7 @@ class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
         self.log(SUCCESS, msg, *args, **kwargs)
 
     def hash(self, msg: str, *args: Any, **kwargs: Any) -> None:
-        to_hash: List[str] = kwargs.pop("hash", [])
+        to_hash: list[str] = kwargs.pop("hash", [])
         for hash in to_hash:
             msg = msg.replace(hash, "*****")
 
@@ -84,7 +85,7 @@ def get_logger(
     file_backup_count: int = 20,
     mask_sensitive: bool = False,
     duplicate_filter: bool = True,
-    mask_sensitive_patterns: List[str] | None = None,
+    mask_sensitive_patterns: list[str] | None = None,
 ) -> logging.Logger:
     """
     Get logger object for logging.
@@ -97,7 +98,7 @@ def get_logger(
         file_max_bytes (int): log file size max size in bytes
         file_backup_count (int): max number of log files to keep
         mask_sensitive (bool): whether to mask sensitive information
-        mask_sensitive_patterns (List[str]): list of patterns to mask
+        mask_sensitive_patterns (list[str]): list of patterns to mask
 
     Returns:
         Logger: logger object
