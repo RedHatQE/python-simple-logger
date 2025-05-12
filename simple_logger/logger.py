@@ -8,6 +8,7 @@ from typing import Any
 
 from colorlog import ColoredFormatter
 
+LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
 
@@ -103,6 +104,9 @@ def get_logger(
         Logger: logger object
 
     """
+    if LOGGERS.get(name):
+        return LOGGERS[name]
+
     logger_obj = logging.getLogger(name)
     log_formatter = WrapperLogFormatter(
         fmt="%(asctime)s %(name)s %(log_color)s%(levelname)s%(reset)s %(message)s",
@@ -141,4 +145,5 @@ def get_logger(
         logger_obj.addHandler(hdlr=log_handler)
 
     logger_obj.propagate = False
+    LOGGERS[name] = logger_obj
     return logger_obj
