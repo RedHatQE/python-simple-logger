@@ -11,6 +11,7 @@ from colorlog import ColoredFormatter
 LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
+STEP: int = 34
 
 
 class DuplicateFilter(logging.Filter):
@@ -61,9 +62,13 @@ class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
 
         logging.addLevelName(SUCCESS, "SUCCESS")
         logging.addLevelName(HASH, "HASH")
+        logging.addLevelName(STEP, "STEP")
 
     def success(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self.log(SUCCESS, msg, *args, **kwargs)
+
+    def step(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self.log(STEP, msg, *args, **kwargs)
 
     def hash(self, msg: str, *args: Any, **kwargs: Any) -> None:
         to_hash: list[str] = kwargs.pop("hash", [])
@@ -118,6 +123,7 @@ def get_logger(
             "ERROR": "red",
             "CRITICAL": "red,bg_white",
             "HASH": "bold_yellow",
+            "STEP": "bold_cyan",
         },
         secondary_log_colors={},
     )
