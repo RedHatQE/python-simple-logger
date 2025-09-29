@@ -431,7 +431,7 @@ wheels = [
 
 [[package]]
 name = "python-simple-logger"
-version = "2.0.16"
+version = "2.0.17"
 source = { editable = "." }
 dependencies = [
     { name = "colorlog" },
