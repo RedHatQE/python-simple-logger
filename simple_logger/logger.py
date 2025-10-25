@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -91,6 +92,7 @@ def get_logger(
     mask_sensitive: bool = False,
     duplicate_filter: bool = True,
     mask_sensitive_patterns: list[str] | None = None,
+    force_color: bool | None = None,
 ) -> logging.Logger:
     """
     Get logger object for logging.
@@ -104,6 +106,8 @@ def get_logger(
         file_backup_count (int): max number of log files to keep
         mask_sensitive (bool): whether to mask sensitive information
         mask_sensitive_patterns (list[str]): list of patterns to mask
+        force_color (bool or None): force colored output even in non-TTY environments.
+            If None, will check FORCE_COLOR environment variable.
 
     Returns:
         Logger: logger object
@@ -111,6 +115,12 @@ def get_logger(
     """
     if LOGGERS.get(name):
         return LOGGERS[name]
+
+    # Determine force_color setting
+    if force_color is None:
+        # Check FORCE_COLOR environment variable
+        force_color_env = os.environ.get("FORCE_COLOR", "").lower()
+        force_color = force_color_env in ("1", "true")
 
     logger_obj = logging.getLogger(name)
     log_formatter = WrapperLogFormatter(
@@ -126,6 +136,7 @@ def get_logger(
             "STEP": "bold_cyan",
         },
         secondary_log_colors={},
+        force_color=force_color,
     )
 
     if console:

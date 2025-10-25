@@ -57,4 +57,13 @@ hashed_logger.info(er = get"This is my secret -> sec1234abc")
 >>> This is my token *****
 >>> This is my apikey *****
 >>> This is my secret *****
+
+# Force colored output in non-TTY environments (Docker, CI/CD)
+# Option 1: Use FORCE_COLOR environment variable
+import os
+os.environ["FORCE_COLOR"] = "1"  # or set in Dockerfile/docker-compose.yml
+logger = get_logger(name=__name__)
+
+# Option 2: Use force_color parameter
+logger = get_logger(name=__name__, force_color=True)
 ```
