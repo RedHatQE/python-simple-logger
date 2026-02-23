@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -54,7 +54,7 @@ class RedactingFilter(logging.Filter):
 
 class WrapperLogFormatter(ColoredFormatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
-        return datetime.fromtimestamp(record.created).isoformat()
+        return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
 
 
 class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
