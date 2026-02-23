@@ -1,5 +1,7 @@
 import logging
+
 import pytest
+
 from simple_logger.logger import get_logger
 
 

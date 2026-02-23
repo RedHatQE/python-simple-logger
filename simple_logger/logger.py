@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -39,7 +39,7 @@ class DuplicateFilter(logging.Filter):
 
 class RedactingFilter(logging.Filter):
     def __init__(self, patterns: list[str]):
-        super(RedactingFilter, self).__init__()
+        super().__init__()
         self._patterns = patterns
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -53,8 +53,8 @@ class RedactingFilter(logging.Filter):
 
 
 class WrapperLogFormatter(ColoredFormatter):
-    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802
-        return datetime.fromtimestamp(record.created).isoformat()
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
 
 
 class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
