@@ -24,7 +24,9 @@ class DuplicateFilter(logging.Filter):
         current_log = (record.module, record.levelno, record.msg)
         if current_log != getattr(self, "last_log", None):
             if _repeated_number > 1:
-                record.msg = f"{record.msg} --- [DuplicateFilter: Last log `{self.last_log[-1]}` repeated {self.repeated_number} times]"
+                # Escape % to prevent %-style formatting from treating them as placeholders
+                _last_log_msg = self.last_log[-1].replace("%", "%%")
+                record.msg = f"{record.msg} --- [DuplicateFilter: Last log `{_last_log_msg}` repeated {self.repeated_number} times]"
 
             self.last_log = current_log
             self.repeated_number = 0
