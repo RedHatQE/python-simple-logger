@@ -81,3 +81,21 @@ def test_levels(tmp_log_file, basic_logger):
     assert "Critical message" in content
     assert "Success message" in content
     assert "repeated 4 times" in content
+
+
+def test_duplicate_filter_with_percent_placeholders(tmp_log_file):
+    logger = get_logger(name="test_duplicate_filter_percent", filename=tmp_log_file, level=logging.DEBUG)
+    url = "http://example.com"
+    job_id = "job-123"
+
+    for _ in range(5):
+        logger.debug("Base URL from Host header: %s", url)
+
+    logger.info("Report generated for job_id: %s", job_id)
+
+    with open(tmp_log_file) as fd:
+        content = fd.read()
+
+    assert "repeated 4 times" in content
+    assert f"Report generated for job_id: {job_id}" in content
+    assert "Last log `Base URL from Host header: %s`" in content
