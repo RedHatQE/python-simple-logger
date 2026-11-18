@@ -1,18 +1,70 @@
 from __future__ import annotations
 
+import codecs
+import errno
+import hashlib
 import logging
 import os
 import re
+import stat
+import tempfile
+import time
+import weakref
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from colorlog import ColoredFormatter
 
+fcntl: Any
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+grp: Any
+pwd: Any
+try:
+    import grp
+    import pwd
+except ImportError:
+    grp = None
+    pwd = None
+
 LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
 STEP: int = 34
+_UNSUPPORTED_LOCK_ERRNOS: frozenset[int] = frozenset({
+    errno.ENOSYS,
+    errno.EOPNOTSUPP,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+    errno.EINVAL,
+})
+
+
+def _is_trusted_owner(
+    st_uid: int,
+    current_uid: int | None,
+    base_uid: int | None,
+    base_gid: int | None,
+    *,
+    group_shared: bool,
+) -> bool:
+    if current_uid is None or st_uid == current_uid:
+        return True
+    if not group_shared:
+        return False
+    if base_uid is not None and st_uid == base_uid:
+        return True
+    if base_gid is not None and pwd is not None and grp is not None:
+        with suppress(KeyError):
+            pw_entry = pwd.getpwuid(st_uid)
+            if pw_entry.pw_gid == base_gid or pw_entry.pw_name in grp.getgrgid(base_gid).gr_mem:
+                return True
+    return False
 
 
 class DuplicateFilter(logging.Filter):
@@ -57,6 +109,497 @@ class RedactingFilter(logging.Filter):
 class WrapperLogFormatter(ColoredFormatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+
+
+class MultiProcessRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler safe for concurrent writes and rotations across processes.
+
+    Note:
+        Pre-existing primary sidecar lock file (``<filename>.lock``) ACLs must match
+        or be updated alongside log file ACL changes when adding new group writers;
+        the sidecar owner automatically syncs the sidecar ACL on lock acquisition.
+    """
+
+    def __init__(
+        self,
+        filename: str | os.PathLike[str],
+        mode: str = "a",
+        maxBytes: int = 0,
+        backupCount: int = 0,
+        encoding: str | None = None,
+        delay: bool = False,
+        errors: str | None = None,
+    ) -> None:
+        self._lock_fd: int | None = None
+        self._lock_pid: int | None = None
+        self._cached_acl: tuple[int, int | None, int | None] | None = None
+        super().__init__(
+            filename=filename,
+            mode=mode,
+            maxBytes=maxBytes,
+            backupCount=backupCount,
+            encoding=encoding,
+            delay=delay,
+            errors=errors,
+        )
+        self.baseFilename = os.path.realpath(self.baseFilename)
+        self._lock_path = f"{self.baseFilename}.lock"
+        self._active_lock_path = self._lock_path
+        _HANDLERS.add(self)
+
+    def _log_acl(self) -> tuple[int, int | None, int | None]:
+        base_stat: os.stat_result | None = None
+        try:
+            base_stat = os.stat(self.baseFilename)
+        except OSError:
+            if self.stream is not None:
+                with suppress(OSError, ValueError):
+                    base_stat = os.fstat(self.stream.fileno())
+
+        if base_stat is not None:
+            mode = 0o600
+            base_mode = stat.S_IMODE(base_stat.st_mode)
+            if base_mode & stat.S_IWGRP:
+                mode |= 0o060
+            if base_mode & stat.S_IWOTH:
+                mode |= 0o006
+            acl: tuple[int, int | None, int | None] = (mode, base_stat.st_uid, base_stat.st_gid)
+            self._cached_acl = acl
+            return acl
+
+        if self._cached_acl is not None:
+            return self._cached_acl
+
+        return (0o600, None, None)
+
+    def _lock_mode(self) -> int:
+        return self._log_acl()[0]
+
+    def _open_fallback_lock_fd(
+        self,
+        lock_mode: int,
+        base_uid: int | None,
+        base_gid: int | None,
+        *,
+        create: bool = True,
+    ) -> int | None:
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        shared_gid = base_gid if (lock_mode & 0o060) else None
+        if shared_gid is not None:
+            dir_name = f"simple-logger-gid-{shared_gid}"
+            dir_mode = 0o770
+            perm_mask = 0o007
+            file_mode = lock_mode & 0o660
+        else:
+            dir_name = f"simple-logger-{uid}" if uid is not None else "simple-logger"
+            dir_mode = 0o700
+            perm_mask = 0o077
+            file_mode = 0o600
+
+        digest = hashlib.sha256(self.baseFilename.encode()).hexdigest()[:16]
+        fallback_dir = os.path.join(tempfile.gettempdir(), dir_name)
+        fallback_path = os.path.join(fallback_dir, f"{digest}.lock")
+        if not create and not os.path.exists(fallback_path):
+            return None
+
+        try:
+            if create:
+                os.makedirs(fallback_dir, mode=dir_mode, exist_ok=True)
+                if shared_gid is not None and hasattr(os, "chown"):
+                    with suppress(OSError):
+                        os.chown(fallback_dir, -1, shared_gid)
+                        os.chmod(fallback_dir, dir_mode)
+            d_st = os.lstat(fallback_dir)
+        except OSError:
+            return None
+
+        if not stat.S_ISDIR(d_st.st_mode) or (d_st.st_mode & perm_mask) != 0:
+            return None
+        if shared_gid is not None and d_st.st_gid != shared_gid:
+            return None
+        if not _is_trusted_owner(d_st.st_uid, uid, base_uid, shared_gid, group_shared=shared_gid is not None):
+            return None
+
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        flags = (os.O_CREAT | os.O_RDWR if create else os.O_RDWR) | no_follow
+        try:
+            try:
+                fd = os.open(fallback_path, flags, file_mode)
+            except PermissionError:
+                if not create or os.path.exists(fallback_path):
+                    fd = os.open(fallback_path, os.O_RDONLY | no_follow)
+                else:
+                    raise
+        except OSError:
+            return None
+
+        if shared_gid is not None:
+            if hasattr(os, "fchown"):
+                with suppress(OSError):
+                    os.fchown(fd, -1, shared_gid)
+            if hasattr(os, "fchmod"):
+                with suppress(OSError):
+                    os.fchmod(fd, file_mode)
+
+        try:
+            f_st = os.fstat(fd)
+            if (
+                not stat.S_ISREG(f_st.st_mode)
+                or (shared_gid is not None and f_st.st_gid != shared_gid)
+                or not _is_trusted_owner(f_st.st_uid, uid, base_uid, shared_gid, group_shared=shared_gid is not None)
+            ):
+                with suppress(OSError):
+                    os.close(fd)
+                return None
+        except OSError:
+            with suppress(OSError):
+                os.close(fd)
+            return None
+
+        self._active_lock_path = fallback_path
+        return fd
+
+    def _get_lock_fd(self) -> int | None:
+        pid = os.getpid()
+        if self._lock_fd is not None and self._lock_pid != pid:
+            self._close_lock_fd()
+        if self._lock_fd is None:
+            lock_mode, base_uid, base_gid = self._log_acl()
+            fd: int | None = None
+            if not os.path.exists(self._lock_path):
+                fd = self._open_fallback_lock_fd(lock_mode, base_uid, base_gid, create=False)
+            if fd is None:
+                created = False
+                try:
+                    for _ in range(3):
+                        try:
+                            fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode & 0o607)
+                            created = True
+                        except FileExistsError:
+                            deadline = time.monotonic() + 0.05
+                            retries = 0
+                            while True:
+                                try:
+                                    try:
+                                        fd = os.open(self._lock_path, os.O_RDWR)
+                                    except PermissionError:
+                                        fd = os.open(self._lock_path, os.O_RDONLY)
+                                    break
+                                except FileNotFoundError:
+                                    fd = None
+                                    break
+                                except PermissionError:
+                                    if not (lock_mode & 0o060) or retries >= 5 or time.monotonic() >= deadline:
+                                        raise
+                                    retries += 1
+                                    time.sleep(0.005)
+                            if fd is None:
+                                continue
+                        break
+                except OSError:
+                    if os.path.exists(self._lock_path):
+                        if self.maxBytes > 0:
+                            raise
+                        return None
+                    fd = None
+
+                if fd is not None:
+                    if created:
+                        try:
+                            if (lock_mode & 0o060) and base_gid is not None:
+                                if not hasattr(os, "fchown"):
+                                    raise PermissionError("os.fchown is unavailable")
+                                os.fchown(fd, -1, base_gid)
+                                if os.fstat(fd).st_gid != base_gid:
+                                    raise PermissionError(
+                                        f"Failed to assign group {base_gid} to lock file {self._lock_path}"
+                                    )
+                        except OSError:
+                            with suppress(OSError):
+                                os.close(fd)
+                            with suppress(OSError):
+                                os.unlink(self._lock_path)
+                            raise
+                        if hasattr(os, "fchmod"):
+                            with suppress(OSError):
+                                os.fchmod(fd, lock_mode)
+                    self._active_lock_path = self._lock_path
+
+            if fd is None:
+                if os.path.exists(self._lock_path):
+                    return None
+                fd = self._open_fallback_lock_fd(lock_mode, base_uid, base_gid, create=True)
+                if fd is None:
+                    return None
+
+            self._lock_fd = fd
+            self._lock_pid = pid
+        return self._lock_fd
+
+    def _sync_primary_lock_acl(self, fd: int) -> None:
+        if self._active_lock_path != self._lock_path:
+            return
+        lock_mode, _base_uid, base_gid = self._log_acl()
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        try:
+            f_st = os.fstat(fd)
+        except OSError:
+            return
+        if uid is not None and f_st.st_uid != uid:
+            return
+        if (lock_mode & 0o060) and base_gid is not None and f_st.st_gid != base_gid:
+            if not hasattr(os, "fchown"):
+                raise PermissionError("os.fchown is unavailable")
+            os.fchown(fd, -1, base_gid)
+            f_st = os.fstat(fd)
+            if f_st.st_gid != base_gid:
+                raise PermissionError(f"Failed to assign group {base_gid} to lock file {self._lock_path}")
+        if (
+            (not (lock_mode & 0o060) or f_st.st_gid == base_gid)
+            and stat.S_IMODE(f_st.st_mode) != lock_mode
+            and hasattr(os, "fchmod")
+        ):
+            with suppress(OSError):
+                os.fchmod(fd, lock_mode)
+
+    def _close_lock_fd(self) -> None:
+        if self._lock_fd is not None:
+            with suppress(OSError):
+                os.close(self._lock_fd)
+            self._lock_fd = None
+            self._lock_pid = None
+
+    @contextmanager
+    def _process_lock(self) -> Generator[None, None, None]:
+        if fcntl is None or self.maxBytes <= 0:
+            yield
+            return
+        while True:
+            fd = self._get_lock_fd()
+            if fd is None:
+                raise OSError(f"Unable to acquire lock for rotating log {self.baseFilename}")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                if exc.errno in _UNSUPPORTED_LOCK_ERRNOS:
+                    self._close_lock_fd()
+                    yield
+                    return
+                raise
+            try:
+                fd_stat = os.fstat(fd)
+                path_stat = os.stat(self._active_lock_path)
+            except FileNotFoundError:
+                with suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                self._close_lock_fd()
+                continue
+            if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                with suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                self._close_lock_fd()
+                continue
+            break
+        try:
+            self._sync_primary_lock_acl(fd)
+            yield
+        finally:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def _reopen_if_rotated(self) -> None:
+        if self.stream is None:
+            return
+        try:
+            stream_stat = os.fstat(self.stream.fileno())
+        except (OSError, ValueError):
+            return
+        try:
+            file_stat = os.stat(self.baseFilename)
+            rotated = (stream_stat.st_dev, stream_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino)
+        except FileNotFoundError:
+            rotated = True
+        if rotated:
+            try:
+                self.stream.close()
+            finally:
+                self.stream = None
+            self.stream = self._open()
+
+    def shouldRollover(self, record: logging.LogRecord, formatted_msg: str | None = None) -> bool:
+        self._reopen_if_rotated()
+        if self.stream is None:
+            self.stream = self._open()
+        if self.maxBytes > 0:
+            size = os.fstat(self.stream.fileno()).st_size
+            if not size:
+                return False
+            if os.path.exists(self.baseFilename) and not os.path.isfile(self.baseFilename):
+                return False
+            msg = self.format(record) if formatted_msg is None else formatted_msg
+            encoding = self.encoding
+            if not encoding or encoding == "locale":
+                stream_encoding = getattr(self.stream, "encoding", None)
+                encoding = stream_encoding if isinstance(stream_encoding, str) else "utf-8"
+            line = f"{msg}{self.terminator}"
+            if os.linesep != "\n":
+                line = line.replace("\n", os.linesep)
+            encoder = codecs.getincrementalencoder(encoding)(self.errors or "replace")
+            if size > 0:
+                with suppress(UnicodeEncodeError):
+                    encoder.encode("0")
+            msg_bytes = len(encoder.encode(line))
+            if size + msg_bytes >= self.maxBytes:
+                return True
+        return False
+
+    @staticmethod
+    def _apply_rollover_acl(fd: int, file_stat: os.stat_result) -> None:
+        target_mode = stat.S_IMODE(file_stat.st_mode)
+        if not (target_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            return
+        try:
+            current_gid = os.fstat(fd).st_gid
+        except OSError:
+            return
+        if target_mode & stat.S_IWGRP and current_gid != file_stat.st_gid:
+            if hasattr(os, "fchown"):
+                with suppress(OSError):
+                    os.fchown(fd, -1, file_stat.st_gid)
+                with suppress(OSError):
+                    current_gid = os.fstat(fd).st_gid
+            if current_gid != file_stat.st_gid:
+                target_mode &= ~stat.S_IRWXG
+        if hasattr(os, "fchmod"):
+            with suppress(OSError):
+                os.fchmod(fd, target_mode)
+
+    def _do_rollover_locked(self) -> None:
+        stream_id: tuple[int, int] | None = None
+        if self.stream is not None:
+            try:
+                st = os.fstat(self.stream.fileno())
+                stream_id = (st.st_dev, st.st_ino)
+            except (OSError, ValueError):
+                pass
+            try:
+                self.stream.close()
+            finally:
+                self.stream = None
+
+        try:
+            file_stat = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            if not self.delay:
+                self.stream = self._open()
+            return
+
+        if (stream_id is not None and (file_stat.st_dev, file_stat.st_ino) != stream_id) or file_stat.st_size == 0:
+            if not self.delay:
+                self.stream = self._open()
+            return
+
+        if self.backupCount > 0:
+            dfn = self.rotation_filename(f"{self.baseFilename}.1")
+            if os.path.exists(dfn):
+                for i in range(self.backupCount - 1, 0, -1):
+                    sfn = self.rotation_filename(f"{self.baseFilename}.{i}")
+                    next_dfn = self.rotation_filename(f"{self.baseFilename}.{i + 1}")
+                    with suppress(FileNotFoundError):
+                        os.replace(sfn, next_dfn)
+            with suppress(FileNotFoundError):
+                if os.name == "nt" and os.path.exists(dfn):
+                    os.remove(dfn)
+                self.rotate(self.baseFilename, dfn)
+
+        if not self.delay:
+            target_mode = stat.S_IMODE(file_stat.st_mode)
+            if target_mode & (stat.S_IWGRP | stat.S_IWOTH) and not os.path.exists(self.baseFilename):
+                # Pre-create with final gid/mode via link so concurrent _log_acl() never sees umask mode.
+                tmp_fd: int | None = None
+                tmp_path: str | None = None
+                try:
+                    tmp_fd, tmp_path = tempfile.mkstemp(
+                        dir=os.path.dirname(self.baseFilename),
+                        prefix=f".{os.path.basename(self.baseFilename)}.",
+                    )
+                    self._apply_rollover_acl(tmp_fd, file_stat)
+                    os.close(tmp_fd)
+                    tmp_fd = None
+                    os.link(tmp_path, self.baseFilename)
+                except OSError:
+                    if tmp_fd is not None:
+                        with suppress(OSError):
+                            os.close(tmp_fd)
+                finally:
+                    if tmp_path is not None:
+                        with suppress(OSError):
+                            os.unlink(tmp_path)
+
+            self.stream = self._open()
+            if target_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                try:
+                    stream_fd = self.stream.fileno()
+                except (OSError, ValueError):
+                    stream_fd = None
+                if stream_fd is not None:
+                    self._apply_rollover_acl(stream_fd, file_stat)
+
+    def doRollover(self) -> None:
+        self.acquire()
+        try:
+            with self._process_lock():
+                try:
+                    file_stat = os.stat(self.baseFilename)
+                except FileNotFoundError:
+                    file_stat = None
+                if file_stat is None or self.maxBytes <= 0 or file_stat.st_size < self.maxBytes:
+                    self._reopen_if_rotated()
+                    if self.stream is None and not self.delay:
+                        self.stream = self._open()
+                    return
+                self._do_rollover_locked()
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            formatted = self.format(record)
+            self.acquire()
+            try:
+                with self._process_lock():
+                    if self.shouldRollover(record, formatted):
+                        self._do_rollover_locked()
+                    if self.stream is None:
+                        self.stream = self._open()
+                    self.stream.write(formatted + self.terminator)
+                    self.flush()
+            finally:
+                self.release()
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
+
+    def close(self) -> None:
+        self.acquire()
+        try:
+            try:
+                super().close()
+            finally:
+                self._close_lock_fd()
+        finally:
+            self.release()
+
+
+_HANDLERS: weakref.WeakSet[MultiProcessRotatingFileHandler] = weakref.WeakSet()
+
+
+def _close_lock_fds_after_fork() -> None:
+    for handler in list(_HANDLERS):
+        handler._close_lock_fd()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_lock_fds_after_fork)
 
 
 class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
@@ -158,7 +701,9 @@ def get_logger(
         logger_obj.addFilter(filter=RedactingFilter(patterns=mask_sensitive_patterns))
 
     if filename:
-        log_handler = RotatingFileHandler(filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count)
+        log_handler = MultiProcessRotatingFileHandler(
+            filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count
+        )
         log_handler.setFormatter(fmt=log_formatter)
         log_handler.setLevel(level=level)
         logger_obj.addHandler(hdlr=log_handler)
