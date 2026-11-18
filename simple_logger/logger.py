@@ -268,10 +268,12 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             if not os.path.exists(self._lock_path):
                 fd = self._open_fallback_lock_fd(lock_mode, base_uid, base_gid, create=False)
             if fd is None:
+                created = False
                 try:
                     for _ in range(3):
                         try:
-                            fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode)
+                            fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode & 0o607)
+                            created = True
                         except FileExistsError:
                             try:
                                 try:
@@ -280,14 +282,6 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                                     fd = os.open(self._lock_path, os.O_RDONLY)
                             except FileNotFoundError:
                                 continue
-                        else:
-                            if (lock_mode & 0o060) and base_gid is not None and hasattr(os, "fchown"):
-                                with suppress(OSError):
-                                    os.fchown(fd, -1, base_gid)
-                            if hasattr(os, "fchmod"):
-                                with suppress(OSError):
-                                    os.fchmod(fd, lock_mode)
-                        self._active_lock_path = self._lock_path
                         break
                 except OSError:
                     if os.path.exists(self._lock_path):
@@ -295,6 +289,28 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                             raise
                         return None
                     fd = None
+
+                if fd is not None:
+                    if created:
+                        try:
+                            if (lock_mode & 0o060) and base_gid is not None:
+                                if not hasattr(os, "fchown"):
+                                    raise PermissionError("os.fchown is unavailable")
+                                os.fchown(fd, -1, base_gid)
+                                if os.fstat(fd).st_gid != base_gid:
+                                    raise PermissionError(
+                                        f"Failed to assign group {base_gid} to lock file {self._lock_path}"
+                                    )
+                        except OSError:
+                            with suppress(OSError):
+                                os.close(fd)
+                            with suppress(OSError):
+                                os.unlink(self._lock_path)
+                            raise
+                        if hasattr(os, "fchmod"):
+                            with suppress(OSError):
+                                os.fchmod(fd, lock_mode)
+                    self._active_lock_path = self._lock_path
 
             if fd is None:
                 if os.path.exists(self._lock_path):
@@ -316,14 +332,22 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             f_st = os.fstat(fd)
         except OSError:
             return
-        needs_group = bool((lock_mode & 0o060) and base_gid is not None and f_st.st_gid != base_gid)
-        if (uid is None or f_st.st_uid == uid) and (stat.S_IMODE(f_st.st_mode) != lock_mode or needs_group):
-            if (lock_mode & 0o060) and base_gid is not None and hasattr(os, "fchown"):
-                with suppress(OSError):
-                    os.fchown(fd, -1, base_gid)
-            if hasattr(os, "fchmod"):
-                with suppress(OSError):
-                    os.fchmod(fd, lock_mode)
+        if uid is not None and f_st.st_uid != uid:
+            return
+        if (lock_mode & 0o060) and base_gid is not None and f_st.st_gid != base_gid:
+            if not hasattr(os, "fchown"):
+                raise PermissionError("os.fchown is unavailable")
+            os.fchown(fd, -1, base_gid)
+            f_st = os.fstat(fd)
+            if f_st.st_gid != base_gid:
+                raise PermissionError(f"Failed to assign group {base_gid} to lock file {self._lock_path}")
+        if (
+            (not (lock_mode & 0o060) or f_st.st_gid == base_gid)
+            and stat.S_IMODE(f_st.st_mode) != lock_mode
+            and hasattr(os, "fchmod")
+        ):
+            with suppress(OSError):
+                os.fchmod(fd, lock_mode)
 
     def _close_lock_fd(self) -> None:
         if self._lock_fd is not None:

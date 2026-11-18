@@ -1325,3 +1325,107 @@ def test_is_trusted_owner_and_sync_primary_lock_acl(
         assert stat.S_IMODE(os.stat(handler._lock_path).st_mode) == 0o660
     finally:
         handler.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 0o660 permissions do not apply on Windows")
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_primary_lock_creation_and_sync_never_widen_on_fchown_failure(
+    tmp_log_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_tmp = tmp_path / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    tmp_log_file.touch()
+    os.chmod(tmp_log_file, 0o660)
+    current_uid = os.getuid()
+    real_gid = os.stat(tmp_log_file).st_gid
+    target_gid = real_gid + 1
+
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        # 1. Primary creation uses owner-only mode (0o600) first and cleans up if fchown fails.
+        open_modes: list[int] = []
+        real_open = os.open
+
+        def spy_open(
+            path: str | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *args: Any,
+            **kwargs: Any,
+        ) -> int:
+            if str(path) == handler._lock_path and (flags & os.O_CREAT):
+                open_modes.append(mode)
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        monkeypatch.setattr(handler, "_log_acl", lambda: (0o660, current_uid, target_gid))
+        monkeypatch.setattr(os, "fchown", MagicMock(side_effect=PermissionError("not in target group")))
+        fchmod_spy = MagicMock(side_effect=os.fchmod)
+        monkeypatch.setattr(os, "fchmod", fchmod_spy)
+
+        with pytest.raises(PermissionError, match="not in target group"):
+            handler._get_lock_fd()
+        assert open_modes == [0o600]
+        assert not os.path.exists(handler._lock_path)
+        assert list(fake_tmp.iterdir()) == []
+        fchmod_spy.assert_not_called()
+
+        # 2. Primary creation also cleans up and raises if st_gid remains mismatched after fchown.
+        monkeypatch.setattr(os, "fchown", MagicMock())
+        with pytest.raises(PermissionError, match="Failed to assign group"):
+            handler._get_lock_fd()
+        assert not os.path.exists(handler._lock_path)
+        fchmod_spy.assert_not_called()
+
+        # 3. _sync_primary_lock_acl never widens permissions when fchown fails or st_gid mismatches.
+        monkeypatch.setattr(handler, "_log_acl", lambda: (0o600, current_uid, real_gid))
+        fd = handler._get_lock_fd()
+        assert fd is not None
+        assert stat.S_IMODE(os.stat(handler._lock_path).st_mode) == 0o600
+
+        monkeypatch.setattr(handler, "_log_acl", lambda: (0o660, current_uid, target_gid))
+        fchmod_spy.reset_mock()
+        monkeypatch.setattr(os, "fchown", MagicMock(side_effect=PermissionError("fchown denied")))
+        with pytest.raises(PermissionError, match="fchown denied"):
+            handler._sync_primary_lock_acl(fd)
+        assert stat.S_IMODE(os.stat(handler._lock_path).st_mode) == 0o600
+        fchmod_spy.assert_not_called()
+
+        monkeypatch.setattr(os, "fchown", MagicMock())
+        with pytest.raises(PermissionError, match="Failed to assign group"):
+            handler._sync_primary_lock_acl(fd)
+        assert stat.S_IMODE(os.stat(handler._lock_path).st_mode) == 0o600
+        fchmod_spy.assert_not_called()
+
+        monkeypatch.delattr(os, "fchown", raising=False)
+        with pytest.raises(PermissionError, match="unavailable"):
+            handler._sync_primary_lock_acl(fd)
+        assert stat.S_IMODE(os.stat(handler._lock_path).st_mode) == 0o600
+        fchmod_spy.assert_not_called()
+
+        # 4. Once fchown updates st_gid to target_gid, _sync_primary_lock_acl widens to 0o660.
+        real_fstat = os.fstat
+        chowned = False
+
+        def fake_fchown(_fd: int, _uid: int, _gid: int) -> None:
+            nonlocal chowned
+            chowned = True
+
+        def fake_fstat(stat_fd: int) -> os.stat_result:
+            st = real_fstat(stat_fd)
+            if stat_fd == fd and chowned:
+                values = list(st)
+                values[stat.ST_GID] = target_gid
+                return os.stat_result(values)
+            return st
+
+        monkeypatch.setattr(os, "fchown", fake_fchown, raising=False)
+        monkeypatch.setattr(os, "fstat", fake_fstat)
+        handler._sync_primary_lock_acl(fd)
+        assert stat.S_IMODE(real_fstat(fd).st_mode) == 0o660
+    finally:
+        handler.close()
