@@ -136,6 +136,38 @@ def _fork_worker(
     handler.emit(_make_record(f"worker={worker_id} idx={count - 1} {'x' * 40}"))
 
 
+def _fork_shared_gid_worker(
+    handler: MultiProcessRotatingFileHandler,
+    worker_id: int,
+    count: int,
+    barrier: multiprocessing.synchronize.Barrier,
+    fallback_ready: multiprocessing.synchronize.Event,
+    queue: multiprocessing.Queue,
+    deny_primary_lock: bool,
+) -> None:
+    if deny_primary_lock:
+        real_open = os.open
+
+        def open_denied(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == handler._lock_path:
+                raise PermissionError("log dir read-only for worker")
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        os.open = open_denied  # type: ignore[assignment]
+        handler.emit(_make_record(f"worker={worker_id} idx=0 {'x' * 40}"))
+        fallback_ready.set()
+        start_idx = 1
+    else:
+        assert fallback_ready.wait(timeout=10)
+        start_idx = 0
+
+    for idx in range(start_idx, count - 1):
+        handler.emit(_make_record(f"worker={worker_id} idx={idx} {'x' * 40}"))
+    barrier.wait(timeout=10)
+    handler.emit(_make_record(f"worker={worker_id} idx={count - 1} {'x' * 40}"))
+    queue.put((worker_id, handler._active_lock_path))
+
+
 def _assert_multiprocess_rollover(
     tmp_log_file,
     num_workers: int,
@@ -729,6 +761,11 @@ def test_lock_mode_and_primary_sidecar_no_split(tmp_log_file, tmp_path, monkeypa
 
         os.chmod(tmp_log_file, 0o660)
         assert handler._lock_mode() == 0o660
+        fd_gid = handler._get_lock_fd()
+        assert fd_gid is not None
+        assert stat.S_IMODE(os.stat(handler._lock_path).st_mode) == 0o660
+        handler._close_lock_fd()
+        os.unlink(handler._lock_path)
 
         os.chmod(tmp_log_file, 0o666)
         assert handler._lock_mode() == 0o666
@@ -751,7 +788,8 @@ def test_lock_mode_and_primary_sidecar_no_split(tmp_log_file, tmp_path, monkeypa
         assert "rdonly-lock-ok" in tmp_log_file.read_text()
         handler._close_lock_fd()
 
-        # Existing sidecar lock that cannot be opened at all returns None without opening fallback in tempdir.
+        # Existing sidecar lock that cannot be opened at all raises PermissionError when maxBytes > 0
+        # without falling back to tempdir, and emit() routes it to handleError.
         temp_opens: list[str] = []
 
         def open_primary_denied(path, flags, mode=0o777, *args, **kwargs):
@@ -762,13 +800,152 @@ def test_lock_mode_and_primary_sidecar_no_split(tmp_log_file, tmp_path, monkeypa
             return real_open(path, flags, mode, *args, **kwargs)
 
         monkeypatch.setattr(os, "open", open_primary_denied)
-        assert handler._get_lock_fd() is None
+        with pytest.raises(PermissionError, match="cannot open lock"):
+            handler._get_lock_fd()
         assert temp_opens == []
         assert list(fake_tmp.iterdir()) == []
-        handler.emit(_make_record("no-split-still-writes"))
-        assert "no-split-still-writes" in tmp_log_file.read_text()
+
+        mock_handle_error = MagicMock()
+        monkeypatch.setattr(handler, "handleError", mock_handle_error)
+        denied_record = _make_record("unwritable-lock-denied")
+        handler.emit(denied_record)
+        mock_handle_error.assert_called_once_with(denied_record)
+        assert "unwritable-lock-denied" not in tmp_log_file.read_text()
     finally:
         handler.close()
+
+
+def test_append_only_max_bytes_zero_skips_locks(tmp_log_file, tmp_path, monkeypatch):
+    fake_tmp = tmp_path / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    real_open = os.open
+
+    def deny_all_locks(path, flags, mode=0o777, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError("lock creation denied")
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_all_locks)
+
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=0, backupCount=2)
+    try:
+        handler.emit(_make_record("append-only-record"))
+        assert "append-only-record" in tmp_log_file.read_text()
+        assert not tmp_log_file.with_name("test.log.lock").exists()
+        assert list(fake_tmp.iterdir()) == []
+        assert handler._lock_fd is None
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 0o660 permissions do not apply on Windows")
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_shared_gid_fallback_convergence(tmp_log_file, tmp_path, monkeypatch):
+    fake_tmp = tmp_path / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    tmp_log_file.touch()
+    os.chmod(tmp_log_file, 0o660)
+    gid = os.stat(tmp_log_file).st_gid
+    real_open = os.open
+
+    def deny_primary_lock(path, flags, mode=0o777, *args, **kwargs):
+        if str(path) == f"{tmp_log_file}.lock":
+            raise PermissionError("log dir read-only for writer B")
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_primary_lock)
+    writer_b = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    writer_a = None
+    try:
+        writer_b.emit(_make_record("from-writer-b"))
+        expected_dir = fake_tmp / f"simple-logger-gid-{gid}"
+        assert writer_b._lock_fd is not None
+        assert writer_b._active_lock_path.startswith(str(expected_dir))
+        assert stat.S_IMODE(os.stat(expected_dir).st_mode) == 0o770
+        assert stat.S_IMODE(os.stat(writer_b._active_lock_path).st_mode) == 0o660
+        assert not tmp_log_file.with_name("test.log.lock").exists()
+
+        # Restore primary directory access for Writer A; it must join Writer B's shared fallback lock.
+        monkeypatch.setattr(os, "open", real_open)
+        writer_a = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+        fd_a = writer_a._get_lock_fd()
+        assert fd_a is not None
+        assert writer_a._active_lock_path == writer_b._active_lock_path
+        assert not tmp_log_file.with_name("test.log.lock").exists()
+
+        writer_a.emit(_make_record("from-writer-a"))
+        assert not tmp_log_file.with_name("test.log.lock").exists()
+        content = tmp_log_file.read_text()
+        assert "from-writer-b" in content
+        assert "from-writer-a" in content
+    finally:
+        if writer_a is not None:
+            writer_a.close()
+        writer_b.close()
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork start method required",
+)
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 0o660 permissions do not apply on Windows")
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_multiprocess_fork_shared_gid_fallback_convergence(tmp_log_file, tmp_path, monkeypatch):
+    fake_tmp = tmp_path / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    tmp_log_file.touch()
+    os.chmod(tmp_log_file, 0o660)
+    gid = os.stat(tmp_log_file).st_gid
+
+    num_workers = 2
+    count = 15
+    max_bytes = 250
+    max_record_len = len(f"worker={num_workers - 1} idx={count - 1} {'x' * 40}\n")
+
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=max_bytes, backupCount=15)
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(num_workers, timeout=10)
+    fallback_ready = ctx.Event()
+    queue: multiprocessing.Queue = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_fork_shared_gid_worker,
+            args=(handler, w, count, barrier, fallback_ready, queue, w == 0),
+        )
+        for w in range(num_workers)
+    ]
+    try:
+        try:
+            for proc in procs:
+                proc.start()
+            for proc in procs:
+                proc.join(timeout=15)
+                assert proc.exitcode == 0
+
+            lock_paths = dict(queue.get(timeout=5) for _ in range(num_workers))
+        finally:
+            _cleanup_processes(procs)
+            queue.close()
+            queue.join_thread()
+    finally:
+        handler.close()
+
+    assert len(lock_paths) == num_workers
+    assert len(set(lock_paths.values())) == 1
+    shared_lock_path = next(iter(lock_paths.values()))
+    assert shared_lock_path.startswith(str(fake_tmp / f"simple-logger-gid-{gid}"))
+    assert not tmp_log_file.with_name("test.log.lock").exists()
+
+    all_lines = _assert_multiprocess_rollover(tmp_log_file, num_workers, count, max_bytes, max_record_len)
+    expected_lines = {f"worker={w} idx={i} {'x' * 40}" for w in range(num_workers) for i in range(count)}
+    assert len(all_lines) == len(expected_lines)
+    assert set(all_lines) == expected_lines
 
 
 @pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
@@ -791,13 +968,17 @@ def test_secure_fallback_dir_and_file_validation(tmp_log_file, tmp_path, monkeyp
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
     try:
         uid = os.getuid() if hasattr(os, "getuid") else 0
-        dir_name = f"simple-logger-{uid}" if hasattr(os, "getuid") else "simple-logger"
-        fallback_dir = str(fake_tmp / dir_name)
+        gid = os.stat(tmp_log_file).st_gid
+        owner_dir_name = f"simple-logger-{uid}" if hasattr(os, "getuid") else "simple-logger"
+        owner_fallback_dir = str(fake_tmp / owner_dir_name)
 
-        def fake_stat_result(st_mode: int, st_uid: int) -> os.stat_result:
-            return os.stat_result((st_mode, 1, 1, 1, st_uid, 0, 0, 0, 0, 0))
+        def fake_stat_result(st_mode: int, st_uid: int, st_gid: int = gid) -> os.stat_result:
+            return os.stat_result((st_mode, 1, 1, 1, st_uid, st_gid, 0, 0, 0, 0))
 
-        # 1. fallback_dir lstat failures: wrong uid, group/other perms, not a dir.
+        # 1. Owner-only fallback_dir lstat OSError and validation failures.
+        monkeypatch.setattr(os, "lstat", MagicMock(side_effect=OSError("lstat failed")))
+        assert handler._get_lock_fd() is None
+
         for bad_mode, bad_uid in [
             (stat.S_IFDIR | 0o700, uid + 1),
             (stat.S_IFDIR | 0o755, uid),
@@ -806,13 +987,42 @@ def test_secure_fallback_dir_and_file_validation(tmp_log_file, tmp_path, monkeyp
             monkeypatch.setattr(
                 os,
                 "lstat",
-                lambda p, m=bad_mode, u=bad_uid: fake_stat_result(m, u) if str(p) == fallback_dir else real_lstat(p),
+                lambda p, m=bad_mode, u=bad_uid: (
+                    fake_stat_result(m, u) if str(p) == owner_fallback_dir else real_lstat(p)
+                ),
             )
             assert handler._get_lock_fd() is None
 
         monkeypatch.setattr(os, "lstat", real_lstat)
 
-        # 2. fallback_path fstat failures: not a regular file, wrong uid, and OSError.
+        # 2. Owner-only fallback_path PermissionError without existing file, then O_RDONLY fallback when it exists.
+        def deny_fallback_create(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == f"{tmp_log_file}.lock" or str(path).startswith(owner_fallback_dir):
+                raise PermissionError("cannot create fallback lock")
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", deny_fallback_create)
+        assert handler._get_lock_fd() is None
+
+        monkeypatch.setattr(os, "open", deny_primary_lock)
+        assert handler._get_lock_fd() is not None
+        owner_fallback_path = handler._active_lock_path
+        handler._close_lock_fd()
+
+        def deny_fallback_rdwr(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == f"{tmp_log_file}.lock":
+                raise PermissionError("primary dir read-only")
+            if str(path) == owner_fallback_path and (flags & os.O_RDWR):
+                raise PermissionError("fallback rdwr denied")
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", deny_fallback_rdwr)
+        assert handler._get_lock_fd() is not None
+        handler._close_lock_fd()
+
+        monkeypatch.setattr(os, "open", deny_primary_lock)
+
+        # 3. Owner-only fallback_path fstat failures: not a regular file, wrong uid, and OSError.
         for bad_fstat in [
             fake_stat_result(stat.S_IFIFO | 0o600, uid),
             fake_stat_result(stat.S_IFREG | 0o600, uid + 1),
@@ -824,6 +1034,53 @@ def test_secure_fallback_dir_and_file_validation(tmp_log_file, tmp_path, monkeyp
         assert handler._get_lock_fd() is None
 
         monkeypatch.setattr(os, "fstat", real_fstat)
+
+        # 4. Group-shared (simple-logger-gid-<gid>) validation failures and O_RDONLY fallback.
+        os.chmod(tmp_log_file, 0o660)
+        gid_fallback_dir = str(fake_tmp / f"simple-logger-gid-{gid}")
+
+        for bad_mode, bad_uid, bad_gid in [
+            (stat.S_IFDIR | 0o770, uid, gid + 1),
+            (stat.S_IFDIR | 0o770, uid + 1, gid),
+            (stat.S_IFDIR | 0o777, uid, gid),
+            (stat.S_IFLNK | 0o770, uid, gid),
+        ]:
+            monkeypatch.setattr(
+                os,
+                "lstat",
+                lambda p, m=bad_mode, u=bad_uid, g=bad_gid: (
+                    fake_stat_result(m, u, g) if str(p) == gid_fallback_dir else real_lstat(p)
+                ),
+            )
+            assert handler._get_lock_fd() is None
+
+        monkeypatch.setattr(os, "lstat", real_lstat)
+
+        for bad_fstat in [
+            fake_stat_result(stat.S_IFIFO | 0o660, uid, gid),
+            fake_stat_result(stat.S_IFREG | 0o660, uid, gid + 1),
+            fake_stat_result(stat.S_IFREG | 0o660, uid + 1, gid),
+        ]:
+            monkeypatch.setattr(os, "fstat", lambda _fd, res=bad_fstat: res)
+            assert handler._get_lock_fd() is None
+
+        monkeypatch.setattr(os, "fstat", real_fstat)
+        assert handler._get_lock_fd() is not None
+        gid_fallback_path = handler._active_lock_path
+        handler._close_lock_fd()
+
+        def deny_gid_fallback_rdwr(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == f"{tmp_log_file}.lock":
+                raise PermissionError("primary dir read-only")
+            if str(path) == gid_fallback_path and (flags & os.O_RDWR):
+                raise PermissionError("gid fallback rdwr denied")
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", deny_gid_fallback_rdwr)
+        assert handler._get_lock_fd() is not None
+        handler._close_lock_fd()
+
+        monkeypatch.setattr(os, "open", deny_primary_lock)
         handler.emit(_make_record("still-writes-after-rejected-fallback"))
         assert "still-writes-after-rejected-fallback" in tmp_log_file.read_text()
     finally:

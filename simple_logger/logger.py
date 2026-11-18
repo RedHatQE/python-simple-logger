@@ -109,78 +109,159 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
         self._active_lock_path = self._lock_path
         _HANDLERS.add(self)
 
-    def _lock_mode(self) -> int:
+    def _log_acl(self) -> tuple[int, int | None, int | None]:
         mode = 0o600
+        base_uid: int | None = None
+        base_gid: int | None = None
         with suppress(OSError):
-            base_mode = stat.S_IMODE(os.stat(self.baseFilename).st_mode)
+            base_stat = os.stat(self.baseFilename)
+            base_mode = stat.S_IMODE(base_stat.st_mode)
             if base_mode & stat.S_IWGRP:
                 mode |= 0o060
             if base_mode & stat.S_IWOTH:
                 mode |= 0o006
-        return mode
+            base_uid = base_stat.st_uid
+            base_gid = base_stat.st_gid
+        return mode, base_uid, base_gid
+
+    def _lock_mode(self) -> int:
+        return self._log_acl()[0]
+
+    def _open_fallback_lock_fd(
+        self,
+        lock_mode: int,
+        base_uid: int | None,
+        base_gid: int | None,
+        *,
+        create: bool = True,
+    ) -> int | None:
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        shared_gid = base_gid if (lock_mode & 0o060) else None
+        if shared_gid is not None:
+            dir_name = f"simple-logger-gid-{shared_gid}"
+            dir_mode = 0o770
+            perm_mask = 0o007
+            file_mode = lock_mode & 0o660
+        else:
+            dir_name = f"simple-logger-{uid}" if uid is not None else "simple-logger"
+            dir_mode = 0o700
+            perm_mask = 0o077
+            file_mode = 0o600
+
+        digest = hashlib.sha256(self.baseFilename.encode()).hexdigest()[:16]
+        fallback_dir = os.path.join(tempfile.gettempdir(), dir_name)
+        fallback_path = os.path.join(fallback_dir, f"{digest}.lock")
+        if not create and not os.path.exists(fallback_path):
+            return None
+
+        try:
+            if create:
+                os.makedirs(fallback_dir, mode=dir_mode, exist_ok=True)
+                if shared_gid is not None and hasattr(os, "chown"):
+                    with suppress(OSError):
+                        os.chown(fallback_dir, -1, shared_gid)
+                        os.chmod(fallback_dir, dir_mode)
+            d_st = os.lstat(fallback_dir)
+        except OSError:
+            return None
+
+        if not stat.S_ISDIR(d_st.st_mode) or (d_st.st_mode & perm_mask) != 0:
+            return None
+        allowed_uids = {u for u in (uid, base_uid) if u is not None}
+        if shared_gid is not None:
+            if d_st.st_gid != shared_gid or (uid is not None and d_st.st_uid not in allowed_uids):
+                return None
+        elif uid is not None and d_st.st_uid != uid:
+            return None
+
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        flags = (os.O_CREAT | os.O_RDWR if create else os.O_RDWR) | no_follow
+        try:
+            try:
+                fd = os.open(fallback_path, flags, file_mode)
+            except PermissionError:
+                if not create or os.path.exists(fallback_path):
+                    fd = os.open(fallback_path, os.O_RDONLY | no_follow)
+                else:
+                    raise
+        except OSError:
+            return None
+
+        if shared_gid is not None:
+            if hasattr(os, "fchown"):
+                with suppress(OSError):
+                    os.fchown(fd, -1, shared_gid)
+            if hasattr(os, "fchmod"):
+                with suppress(OSError):
+                    os.fchmod(fd, file_mode)
+
+        try:
+            f_st = os.fstat(fd)
+            if not stat.S_ISREG(f_st.st_mode):
+                with suppress(OSError):
+                    os.close(fd)
+                return None
+            if shared_gid is not None:
+                if f_st.st_gid != shared_gid or (uid is not None and f_st.st_uid not in allowed_uids):
+                    with suppress(OSError):
+                        os.close(fd)
+                    return None
+            elif uid is not None and f_st.st_uid != uid:
+                with suppress(OSError):
+                    os.close(fd)
+                return None
+        except OSError:
+            with suppress(OSError):
+                os.close(fd)
+            return None
+
+        self._active_lock_path = fallback_path
+        return fd
 
     def _get_lock_fd(self) -> int | None:
         pid = os.getpid()
         if self._lock_fd is not None and self._lock_pid != pid:
             self._close_lock_fd()
         if self._lock_fd is None:
-            lock_mode = self._lock_mode()
+            lock_mode, base_uid, base_gid = self._log_acl()
             fd: int | None = None
-            try:
-                for _ in range(3):
-                    try:
-                        fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode)
-                    except FileExistsError:
+            if not os.path.exists(self._lock_path):
+                fd = self._open_fallback_lock_fd(lock_mode, base_uid, base_gid, create=False)
+            if fd is None:
+                try:
+                    for _ in range(3):
                         try:
+                            fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode)
+                        except FileExistsError:
                             try:
-                                fd = os.open(self._lock_path, os.O_RDWR)
-                            except PermissionError:
-                                fd = os.open(self._lock_path, os.O_RDONLY)
-                        except FileNotFoundError:
-                            continue
-                    else:
-                        if hasattr(os, "fchmod"):
-                            with suppress(OSError):
-                                os.fchmod(fd, lock_mode)
-                    self._active_lock_path = self._lock_path
-                    break
-            except OSError:
-                if os.path.exists(self._lock_path):
-                    return None
-                fd = None
+                                try:
+                                    fd = os.open(self._lock_path, os.O_RDWR)
+                                except PermissionError:
+                                    fd = os.open(self._lock_path, os.O_RDONLY)
+                            except FileNotFoundError:
+                                continue
+                        else:
+                            if (lock_mode & 0o060) and base_gid is not None and hasattr(os, "fchown"):
+                                with suppress(OSError):
+                                    os.fchown(fd, -1, base_gid)
+                            if hasattr(os, "fchmod"):
+                                with suppress(OSError):
+                                    os.fchmod(fd, lock_mode)
+                        self._active_lock_path = self._lock_path
+                        break
+                except OSError:
+                    if os.path.exists(self._lock_path):
+                        if self.maxBytes > 0:
+                            raise
+                        return None
+                    fd = None
 
             if fd is None:
                 if os.path.exists(self._lock_path):
                     return None
-                digest = hashlib.sha256(self.baseFilename.encode()).hexdigest()[:16]
-                uid = os.getuid() if hasattr(os, "getuid") else None
-                dir_name = f"simple-logger-{uid}" if uid is not None else "simple-logger"
-                fallback_dir = os.path.join(tempfile.gettempdir(), dir_name)
-                try:
-                    os.makedirs(fallback_dir, mode=0o700, exist_ok=True)
-                    d_st = os.lstat(fallback_dir)
-                    if (
-                        not stat.S_ISDIR(d_st.st_mode)
-                        or (uid is not None and d_st.st_uid != uid)
-                        or (d_st.st_mode & 0o077) != 0
-                    ):
-                        return None
-                    fallback_path = os.path.join(fallback_dir, f"{digest}.lock")
-                    no_follow = getattr(os, "O_NOFOLLOW", 0)
-                    fd = os.open(fallback_path, os.O_CREAT | os.O_RDWR | no_follow, 0o600)
-                except OSError:
+                fd = self._open_fallback_lock_fd(lock_mode, base_uid, base_gid, create=True)
+                if fd is None:
                     return None
-                try:
-                    f_st = os.fstat(fd)
-                    if not stat.S_ISREG(f_st.st_mode) or (uid is not None and f_st.st_uid != uid):
-                        with suppress(OSError):
-                            os.close(fd)
-                        return None
-                except OSError:
-                    with suppress(OSError):
-                        os.close(fd)
-                    return None
-                self._active_lock_path = fallback_path
 
             self._lock_fd = fd
             self._lock_pid = pid
@@ -195,7 +276,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
 
     @contextmanager
     def _process_lock(self) -> Generator[None, None, None]:
-        if fcntl is None:
+        if fcntl is None or self.maxBytes <= 0:
             yield
             return
         while True:
