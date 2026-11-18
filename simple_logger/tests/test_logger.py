@@ -1429,3 +1429,127 @@ def test_primary_lock_creation_and_sync_never_widen_on_fchown_failure(
         assert stat.S_IMODE(real_fstat(fd).st_mode) == 0o660
     finally:
         handler.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 0o660 permissions do not apply on Windows")
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_group_sidecar_open_retries_transient_permission_error(
+    tmp_log_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_tmp = tmp_log_file.parent / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    tmp_log_file.touch()
+    os.chmod(tmp_log_file, 0o660)
+    lock_path = tmp_log_file.with_name("test.log.lock")
+    lock_path.write_text("")
+
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        real_open = os.open
+        open_attempts = 0
+
+        def open_transient_denied(
+            path: str | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *args: Any,
+            **kwargs: Any,
+        ) -> int:
+            nonlocal open_attempts
+            if str(path) == handler._lock_path and not (flags & os.O_CREAT):
+                open_attempts += 1
+                if open_attempts <= 2:
+                    raise PermissionError("transient lock permission error")
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_transient_denied)
+        fd = handler._get_lock_fd()
+        assert fd is not None
+        assert open_attempts == 3
+        assert handler._active_lock_path == handler._lock_path
+
+        handler.emit(_make_record("transient-retry-ok"))
+        assert "transient-retry-ok" in tmp_log_file.read_text()
+        handler._close_lock_fd()
+
+        persistent_attempts = 0
+        temp_opens: list[str] = []
+
+        def open_persistent_denied(
+            path: str | os.PathLike[str],
+            flags: int,
+            mode: int = 0o777,
+            *args: Any,
+            **kwargs: Any,
+        ) -> int:
+            nonlocal persistent_attempts
+            if str(path) == handler._lock_path and not (flags & os.O_CREAT):
+                persistent_attempts += 1
+                raise PermissionError("persistent lock permission error")
+            if str(path).startswith(str(fake_tmp)):
+                temp_opens.append(str(path))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_persistent_denied)
+        with pytest.raises(PermissionError, match="persistent lock permission error"):
+            handler._get_lock_fd()
+        assert 2 <= persistent_attempts <= 12
+        assert handler._lock_fd is None
+        assert temp_opens == []
+        assert list(fake_tmp.iterdir()) == []
+
+        mock_handle_error = MagicMock()
+        monkeypatch.setattr(handler, "handleError", mock_handle_error)
+        blocked_record = _make_record("persistent-lock-denied")
+        handler.emit(blocked_record)
+        mock_handle_error.assert_called_once_with(blocked_record)
+        assert "persistent-lock-denied" not in tmp_log_file.read_text()
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 0o660 permissions do not apply on Windows")
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_do_rollover_preserves_group_mode_and_strips_on_gid_mismatch(
+    tmp_log_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_umask = os.umask(0o022)
+    handler: MultiProcessRotatingFileHandler | None = None
+    try:
+        tmp_log_file.touch()
+        os.chmod(tmp_log_file, 0o660)
+
+        handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=15, backupCount=2)
+        handler.emit(_make_record("first-msg"))
+        assert stat.S_IMODE(tmp_log_file.stat().st_mode) == 0o660
+
+        handler.emit(_make_record("second-msg"))
+        assert tmp_log_file.with_name("test.log.1").exists()
+        assert stat.S_IMODE(tmp_log_file.stat().st_mode) == 0o660
+        assert "second-msg" in tmp_log_file.read_text()
+
+        original_gid = tmp_log_file.stat().st_gid
+        real_fstat = os.fstat
+
+        def fstat_mismatched_gid(stat_fd: int) -> os.stat_result:
+            st = real_fstat(stat_fd)
+            if handler is not None and stat_fd != handler._lock_fd:
+                values = list(st)
+                values[stat.ST_GID] = original_gid + 1
+                return os.stat_result(values)
+            return st
+
+        monkeypatch.setattr(os, "fstat", fstat_mismatched_gid)
+        monkeypatch.setattr(os, "fchown", MagicMock(side_effect=OSError("chgrp failed")))
+
+        handler.emit(_make_record("third-message"))
+        assert (stat.S_IMODE(tmp_log_file.stat().st_mode) & stat.S_IRWXG) == 0
+        assert "third-message" in tmp_log_file.read_text()
+    finally:
+        if handler is not None:
+            handler.close()
+        os.umask(old_umask)

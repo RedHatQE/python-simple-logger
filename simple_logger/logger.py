@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 import weakref
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
@@ -275,12 +276,24 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                             fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode & 0o607)
                             created = True
                         except FileExistsError:
-                            try:
+                            deadline = time.monotonic() + 0.05
+                            retries = 0
+                            while True:
                                 try:
-                                    fd = os.open(self._lock_path, os.O_RDWR)
+                                    try:
+                                        fd = os.open(self._lock_path, os.O_RDWR)
+                                    except PermissionError:
+                                        fd = os.open(self._lock_path, os.O_RDONLY)
+                                    break
+                                except FileNotFoundError:
+                                    fd = None
+                                    break
                                 except PermissionError:
-                                    fd = os.open(self._lock_path, os.O_RDONLY)
-                            except FileNotFoundError:
+                                    if not (lock_mode & 0o060) or retries >= 5 or time.monotonic() >= deadline:
+                                        raise
+                                    retries += 1
+                                    time.sleep(0.005)
+                            if fd is None:
                                 continue
                         break
                 except OSError:
@@ -440,6 +453,27 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                 return True
         return False
 
+    @staticmethod
+    def _apply_rollover_acl(fd: int, file_stat: os.stat_result) -> None:
+        target_mode = stat.S_IMODE(file_stat.st_mode)
+        if not (target_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            return
+        try:
+            current_gid = os.fstat(fd).st_gid
+        except OSError:
+            return
+        if target_mode & stat.S_IWGRP and current_gid != file_stat.st_gid:
+            if hasattr(os, "fchown"):
+                with suppress(OSError):
+                    os.fchown(fd, -1, file_stat.st_gid)
+                with suppress(OSError):
+                    current_gid = os.fstat(fd).st_gid
+            if current_gid != file_stat.st_gid:
+                target_mode &= ~stat.S_IRWXG
+        if hasattr(os, "fchmod"):
+            with suppress(OSError):
+                os.fchmod(fd, target_mode)
+
     def _do_rollover_locked(self) -> None:
         stream_id: tuple[int, int] | None = None
         if self.stream is not None:
@@ -479,7 +513,37 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                 self.rotate(self.baseFilename, dfn)
 
         if not self.delay:
+            target_mode = stat.S_IMODE(file_stat.st_mode)
+            if target_mode & (stat.S_IWGRP | stat.S_IWOTH) and not os.path.exists(self.baseFilename):
+                # Pre-create with final gid/mode via link so concurrent _log_acl() never sees umask mode.
+                tmp_fd: int | None = None
+                tmp_path: str | None = None
+                try:
+                    tmp_fd, tmp_path = tempfile.mkstemp(
+                        dir=os.path.dirname(self.baseFilename),
+                        prefix=f".{os.path.basename(self.baseFilename)}.",
+                    )
+                    self._apply_rollover_acl(tmp_fd, file_stat)
+                    os.close(tmp_fd)
+                    tmp_fd = None
+                    os.link(tmp_path, self.baseFilename)
+                except OSError:
+                    if tmp_fd is not None:
+                        with suppress(OSError):
+                            os.close(tmp_fd)
+                finally:
+                    if tmp_path is not None:
+                        with suppress(OSError):
+                            os.unlink(tmp_path)
+
             self.stream = self._open()
+            if target_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                try:
+                    stream_fd = self.stream.fileno()
+                except (OSError, ValueError):
+                    stream_fd = None
+                if stream_fd is not None:
+                    self._apply_rollover_acl(stream_fd, file_stat)
 
     def doRollover(self) -> None:
         self.acquire()
