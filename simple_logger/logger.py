@@ -12,7 +12,7 @@ import time
 import weakref
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -108,7 +108,7 @@ class RedactingFilter(logging.Filter):
 
 class WrapperLogFormatter(ColoredFormatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
-        return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(record.created, tz=UTC).isoformat()
 
 
 class MultiProcessRotatingFileHandler(RotatingFileHandler):
@@ -370,7 +370,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             self._lock_pid = None
 
     @contextmanager
-    def _process_lock(self) -> Generator[None, None, None]:
+    def _process_lock(self) -> Generator[None]:
         if fcntl is None or self.maxBytes <= 0:
             yield
             return
@@ -412,7 +412,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             return
         try:
             stream_stat = os.fstat(self.stream.fileno())
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return
         try:
             file_stat = os.stat(self.baseFilename)
@@ -480,7 +480,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             try:
                 st = os.fstat(self.stream.fileno())
                 stream_id = (st.st_dev, st.st_ino)
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 pass
             try:
                 self.stream.close()
@@ -540,7 +540,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             if target_mode & (stat.S_IWGRP | stat.S_IWOTH):
                 try:
                     stream_fd = self.stream.fileno()
-                except (OSError, ValueError):
+                except OSError, ValueError:
                     stream_fd = None
                 if stream_fd is not None:
                     self._apply_rollover_acl(stream_fd, file_stat)
