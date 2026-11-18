@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import weakref
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
@@ -93,8 +94,10 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             delay=delay,
             errors=errors,
         )
+        self.baseFilename = os.path.realpath(self.baseFilename)
         self._lock_path = f"{self.baseFilename}.lock"
         self._active_lock_path = self._lock_path
+        _HANDLERS.add(self)
 
     def _get_lock_fd(self) -> int | None:
         pid = os.getpid()
@@ -102,13 +105,13 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             self._close_lock_fd()
         if self._lock_fd is None:
             try:
-                fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+                fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
                 self._active_lock_path = self._lock_path
             except OSError:
                 digest = hashlib.sha256(self.baseFilename.encode()).hexdigest()[:16]
                 fallback_path = os.path.join(tempfile.gettempdir(), f"simple-logger-{digest}.lock")
                 try:
-                    fd = os.open(fallback_path, os.O_CREAT | os.O_RDWR, 0o666)
+                    fd = os.open(fallback_path, os.O_CREAT | os.O_RDWR, 0o600)
                     self._active_lock_path = fallback_path
                 except OSError:
                     return None
@@ -173,7 +176,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                 self.stream = None
             self.stream = self._open()
 
-    def shouldRollover(self, record: logging.LogRecord) -> bool:
+    def shouldRollover(self, record: logging.LogRecord, formatted_msg: str | None = None) -> bool:
         self._reopen_if_rotated()
         if self.stream is None:
             self.stream = self._open()
@@ -183,7 +186,13 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                 return False
             if os.path.exists(self.baseFilename) and not os.path.isfile(self.baseFilename):
                 return False
-            if size + len(f"{self.format(record)}\n") >= self.maxBytes:
+            msg = self.format(record) if formatted_msg is None else formatted_msg
+            encoding = self.encoding
+            if not encoding or encoding == "locale":
+                stream_encoding = getattr(self.stream, "encoding", None)
+                encoding = stream_encoding if isinstance(stream_encoding, str) else "utf-8"
+            msg_bytes = len((msg + self.terminator).encode(encoding, self.errors or "replace"))
+            if size + msg_bytes >= self.maxBytes:
                 return True
         return False
 
@@ -213,12 +222,13 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             return
 
         if self.backupCount > 0:
-            for i in range(self.backupCount - 1, 0, -1):
-                sfn = self.rotation_filename(f"{self.baseFilename}.{i}")
-                dfn = self.rotation_filename(f"{self.baseFilename}.{i + 1}")
-                with suppress(FileNotFoundError):
-                    os.replace(sfn, dfn)
             dfn = self.rotation_filename(f"{self.baseFilename}.1")
+            if os.path.exists(dfn):
+                for i in range(self.backupCount - 1, 0, -1):
+                    sfn = self.rotation_filename(f"{self.baseFilename}.{i}")
+                    next_dfn = self.rotation_filename(f"{self.baseFilename}.{i + 1}")
+                    with suppress(FileNotFoundError):
+                        os.replace(sfn, next_dfn)
             with suppress(FileNotFoundError):
                 if os.name == "nt" and os.path.exists(dfn):
                     os.remove(dfn)
@@ -246,10 +256,18 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            with self._process_lock():
-                if self.shouldRollover(record):
-                    self._do_rollover_locked()
-                logging.FileHandler.emit(self, record)
+            formatted = self.format(record)
+            self.acquire()
+            try:
+                with self._process_lock():
+                    if self.shouldRollover(record, formatted):
+                        self._do_rollover_locked()
+                    if self.stream is None:
+                        self.stream = self._open()
+                    self.stream.write(formatted + self.terminator)
+                    self.flush()
+            finally:
+                self.release()
         except Exception:  # noqa: BLE001
             self.handleError(record)
 
@@ -262,6 +280,18 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                 self._close_lock_fd()
         finally:
             self.release()
+
+
+_HANDLERS: weakref.WeakSet[MultiProcessRotatingFileHandler] = weakref.WeakSet()
+
+
+def _close_lock_fds_after_fork() -> None:
+    for handler in list(_HANDLERS):
+        handler._close_lock_fd()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_lock_fds_after_fork)
 
 
 class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]

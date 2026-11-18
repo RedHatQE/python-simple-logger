@@ -1,9 +1,10 @@
 import logging
 import multiprocessing
 import os
+import stat
 import tempfile
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from unittest.mock import MagicMock
 
 import pytest
@@ -179,6 +180,7 @@ def test_multiprocess_fork_and_rollover(tmp_log_file):
         assert line == "parent-init" or line.startswith("worker=")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot rename or unlink an open log file")
 def test_reopen_if_rotated_and_missing_file(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
     try:
@@ -248,6 +250,7 @@ def test_do_rollover_skips_below_max_bytes(tmp_log_file):
         handler.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot rename or unlink an open log file")
 def test_do_rollover_skips_when_already_rotated_empty_or_missing(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=50, backupCount=2)
     try:
@@ -452,6 +455,177 @@ def test_non_posix_fallback_and_emit_error_handling(tmp_log_file, monkeypatch):
         record = _make_record("triggers-error")
         handler.emit(record)
         mock_handle_error.assert_called_once_with(record)
+    finally:
+        handler.close()
+
+
+def _inspect_lock_fd_in_child(handler: MultiProcessRotatingFileHandler, queue: multiprocessing.Queue) -> None:
+    queue.put((handler._lock_fd, handler._lock_pid))
+
+
+def test_close_lock_fds_after_fork_closes_registered_handlers(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        handler.emit(_make_record("open-lock"))
+        old_fd = handler._lock_fd
+        assert old_fd is not None
+        assert handler._lock_pid == os.getpid()
+
+        logger_module._close_lock_fds_after_fork()
+
+        assert handler._lock_fd is None
+        assert handler._lock_pid is None
+        with pytest.raises(OSError):
+            os.fstat(old_fd)
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork is unavailable on this platform")
+def test_idle_forked_child_closes_inherited_lock_fd(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        handler.emit(_make_record("parent-open-lock"))
+        parent_fd = handler._lock_fd
+        parent_pid = handler._lock_pid
+        assert parent_fd is not None
+        assert parent_pid == os.getpid()
+
+        ctx = multiprocessing.get_context("fork")
+        queue: multiprocessing.Queue = ctx.Queue()
+        proc = ctx.Process(target=_inspect_lock_fd_in_child, args=(handler, queue))
+        try:
+            proc.start()
+            proc.join(timeout=10)
+            assert proc.exitcode == 0
+            child_lock_fd, child_lock_pid = queue.get(timeout=5)
+        finally:
+            _cleanup_processes([proc])
+            queue.close()
+            queue.join_thread()
+
+        assert child_lock_fd is None
+        assert child_lock_pid is None
+        assert handler._lock_fd == parent_fd
+        assert handler._lock_pid == parent_pid
+        assert os.fstat(parent_fd).st_ino == os.stat(handler._active_lock_path).st_ino
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 0o600 permissions do not apply on Windows")
+def test_sidecar_lock_file_has_owner_only_permissions(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        handler.emit(_make_record("create-lock"))
+        lock_path = tmp_log_file.with_name("test.log.lock")
+        assert lock_path.exists()
+        assert stat.S_IMODE(os.stat(lock_path).st_mode) == 0o600
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlinks may require elevated privileges on Windows")
+def test_symlink_base_filename_normalized_to_realpath(tmp_log_file):
+    real_log = tmp_log_file.with_name("real.log")
+    symlink_log = tmp_log_file.with_name("link.log")
+    os.symlink(real_log, symlink_log)
+
+    handler = MultiProcessRotatingFileHandler(filename=symlink_log, maxBytes=1024, backupCount=2)
+    try:
+        expected_real = os.path.realpath(real_log)
+        assert handler.baseFilename == expected_real
+        assert handler._lock_path == f"{expected_real}.lock"
+
+        handler.emit(_make_record("via-symlink"))
+        assert "via-symlink" in real_log.read_text()
+        assert os.path.exists(f"{expected_real}.lock")
+        assert not os.path.exists(f"{symlink_log}.lock")
+    finally:
+        handler.close()
+
+
+def test_should_rollover_uses_utf8_byte_length(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=20, backupCount=2, encoding="utf-8")
+    try:
+        large_record = _make_record("é" * 10)
+        # Empty file (size == 0) never rolls over even when encoded record exceeds maxBytes.
+        assert handler.shouldRollover(large_record) is False
+
+        # 2 bytes on disk + 11 chars ("é"*10 + "\n") = 13 < 20, but 2 + 21 UTF-8 bytes = 23 >= 20.
+        handler.emit(_make_record("a"))
+        assert tmp_log_file.stat().st_size == 2
+        assert len("é" * 10 + handler.terminator) + 2 < 20
+        assert handler.shouldRollover(large_record) is True
+    finally:
+        handler.close()
+
+
+def test_do_rollover_retry_after_rotate_failure_does_not_reshift_backups(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=20, backupCount=3)
+    try:
+        handler.emit(_make_record("backup-two-long-enough"))
+        handler.emit(_make_record("backup-one-long-enough"))
+        handler.emit(_make_record("active-log-long-enough"))
+
+        backup_1 = tmp_log_file.with_name("test.log.1")
+        backup_2 = tmp_log_file.with_name("test.log.2")
+        backup_3 = tmp_log_file.with_name("test.log.3")
+        assert backup_1.read_text() == "backup-one-long-enough\n"
+        assert backup_2.read_text() == "backup-two-long-enough\n"
+        assert tmp_log_file.read_text() == "active-log-long-enough\n"
+
+        real_rotate = handler.rotate
+        monkeypatch.setattr(handler, "rotate", MagicMock(side_effect=PermissionError("rotate failed")))
+        with pytest.raises(PermissionError, match="rotate failed"):
+            handler.doRollover()
+
+        assert not backup_1.exists()
+        assert backup_2.read_text() == "backup-one-long-enough\n"
+        assert backup_3.read_text() == "backup-two-long-enough\n"
+        assert tmp_log_file.read_text() == "active-log-long-enough\n"
+
+        monkeypatch.setattr(handler, "rotate", real_rotate)
+        handler.doRollover()
+
+        assert backup_1.read_text() == "active-log-long-enough\n"
+        assert backup_2.read_text() == "backup-one-long-enough\n"
+        assert backup_3.read_text() == "backup-two-long-enough\n"
+        assert tmp_log_file.read_text() == ""
+    finally:
+        handler.close()
+
+
+def test_emit_formats_outside_process_lock(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        events: list[str] = []
+        in_lock = False
+        orig_process_lock = handler._process_lock
+
+        @contextmanager
+        def tracking_lock():
+            nonlocal in_lock
+            with orig_process_lock():
+                in_lock = True
+                events.append("lock_enter")
+                try:
+                    yield
+                finally:
+                    events.append("lock_exit")
+                    in_lock = False
+
+        class LazyMessage:
+            def __str__(self) -> str:
+                assert not in_lock
+                events.append("format")
+                return "formatted-before-lock"
+
+        monkeypatch.setattr(handler, "_process_lock", tracking_lock)
+        handler.emit(_make_record(LazyMessage()))
+
+        assert events == ["format", "lock_enter", "lock_exit"]
+        assert tmp_log_file.read_text() == "formatted-before-lock\n"
     finally:
         handler.close()
 
