@@ -1,6 +1,9 @@
 import logging
 import multiprocessing
 import os
+import tempfile
+import time
+from contextlib import suppress
 from unittest.mock import MagicMock
 
 import pytest
@@ -122,6 +125,16 @@ def _fork_worker(handler: MultiProcessRotatingFileHandler, worker_id: int, count
         handler.emit(_make_record(f"worker={worker_id} idx={idx} {'x' * 40}"))
 
 
+def _cleanup_processes(procs: list[multiprocessing.process.BaseProcess]) -> None:
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+
+
 def test_get_logger_uses_multiprocess_handler(tmp_log_file):
     log = get_logger(name="test_mp_handler_type", filename=tmp_log_file, console=False)
     file_handlers = [h for h in log.handlers if isinstance(h, MultiProcessRotatingFileHandler)]
@@ -131,21 +144,26 @@ def test_get_logger_uses_multiprocess_handler(tmp_log_file):
 
 def test_multiprocess_fork_and_rollover(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=250, backupCount=3)
-    # Open the lock FD in parent before forking to verify child PID reopens its own lock FD.
-    handler.emit(_make_record("parent-init"))
-    parent_lock_fd = handler._lock_fd
-    assert parent_lock_fd is not None
-    assert handler._lock_pid == os.getpid()
+    try:
+        # Open the lock FD in parent before forking to verify child PID reopens its own lock FD.
+        handler.emit(_make_record("parent-init"))
+        parent_lock_fd = handler._lock_fd
+        assert parent_lock_fd is not None
+        assert handler._lock_pid == os.getpid()
 
-    ctx = multiprocessing.get_context("fork")
-    procs = [ctx.Process(target=_fork_worker, args=(handler, w, 15)) for w in range(4)]
-    for proc in procs:
-        proc.start()
-    for proc in procs:
-        proc.join(timeout=15)
-        assert proc.exitcode == 0
+        ctx = multiprocessing.get_context("fork")
+        procs = [ctx.Process(target=_fork_worker, args=(handler, w, 15)) for w in range(4)]
+        try:
+            for proc in procs:
+                proc.start()
+            for proc in procs:
+                proc.join(timeout=15)
+                assert proc.exitcode == 0
+        finally:
+            _cleanup_processes(procs)
+    finally:
+        handler.close()
 
-    handler.close()
     assert handler._lock_fd is None
     assert handler._lock_pid is None
 
@@ -218,6 +236,18 @@ def test_should_rollover_edge_cases(tmp_log_file, monkeypatch):
         handler.close()
 
 
+def test_do_rollover_skips_below_max_bytes(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=100, backupCount=2)
+    try:
+        handler.emit(_make_record("small-line"))
+        assert 0 < tmp_log_file.stat().st_size < 100
+        handler.doRollover()
+        assert not tmp_log_file.with_name("test.log.1").exists()
+        assert tmp_log_file.read_text() == "small-line\n"
+    finally:
+        handler.close()
+
+
 def test_do_rollover_skips_when_already_rotated_empty_or_missing(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=50, backupCount=2)
     try:
@@ -234,25 +264,178 @@ def test_do_rollover_skips_when_already_rotated_empty_or_missing(tmp_log_file):
         # Another process already rotated before doRollover acquired lock (inode changed).
         handler.emit(_make_record("initial"))
         os.rename(tmp_log_file, tmp_log_file.with_name("test.log.1"))
-        tmp_log_file.write_text("from-other-process\n")
+        external_content = f"from-other-process-{'x' * 50}\n"
+        tmp_log_file.write_text(external_content)
         handler.doRollover()
-        assert tmp_log_file.read_text() == "from-other-process\n"
+        assert tmp_log_file.read_text() == external_content
+        assert tmp_log_file.with_name("test.log.1").read_text() == "initial\n"
     finally:
         handler.close()
 
 
-def test_do_rollover_suppresses_transient_oserror(tmp_log_file, monkeypatch):
-    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=20, backupCount=2)
+def test_do_rollover_suppresses_file_not_found_error(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=20, backupCount=3)
     try:
         handler.emit(_make_record("line-one-long-enough"))
-        handler.emit(_make_record("line-two-long-enough"))
-        assert tmp_log_file.with_name("test.log.1").exists()
+        assert tmp_log_file.stat().st_size >= 20
 
-        monkeypatch.setattr(handler, "rotate", MagicMock(side_effect=OSError("transient")))
+        monkeypatch.setattr(handler, "rotate", MagicMock(side_effect=FileNotFoundError("vanished")))
         handler.doRollover()
         assert handler.stream is not None
     finally:
         handler.close()
+
+
+def test_do_rollover_propagates_oserror_on_backup_shift(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=20, backupCount=2)
+    try:
+        handler.emit(_make_record("line-one-long-enough"))
+        handler.emit(_make_record("line-two-long-enough"))
+        backup_one = tmp_log_file.with_name("test.log.1")
+        assert backup_one.read_text() == "line-one-long-enough\n"
+
+        monkeypatch.setattr(os, "replace", MagicMock(side_effect=PermissionError("disk error")))
+        with pytest.raises(PermissionError, match="disk error"):
+            handler.doRollover()
+        assert backup_one.read_text() == "line-one-long-enough\n"
+
+        mock_handle_error = MagicMock()
+        monkeypatch.setattr(handler, "handleError", mock_handle_error)
+        record = _make_record("triggers-backup-shift-error")
+        handler.emit(record)
+        mock_handle_error.assert_called_once_with(record)
+        assert backup_one.read_text() == "line-one-long-enough\n"
+    finally:
+        handler.close()
+
+
+def test_do_rollover_propagates_oserror_on_rotate(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=20, backupCount=1)
+    try:
+        handler.emit(_make_record("line-one-long-enough"))
+        handler.emit(_make_record("line-two-long-enough"))
+        backup_one = tmp_log_file.with_name("test.log.1")
+        assert backup_one.read_text() == "line-one-long-enough\n"
+
+        monkeypatch.setattr(handler, "rotate", MagicMock(side_effect=OSError("disk error")))
+        with pytest.raises(OSError, match="disk error"):
+            handler.doRollover()
+        assert backup_one.read_text() == "line-one-long-enough\n"
+
+        mock_handle_error = MagicMock()
+        monkeypatch.setattr(handler, "handleError", mock_handle_error)
+        record = _make_record("triggers-rotate-error")
+        handler.emit(record)
+        mock_handle_error.assert_called_once_with(record)
+        assert backup_one.read_text() == "line-one-long-enough\n"
+    finally:
+        handler.close()
+
+
+def test_lock_fallback_and_no_lock_preserves_writes(tmp_log_file, monkeypatch):
+    real_open = os.open
+
+    def fail_primary_lock(path, flags, mode=0o777, *args, **kwargs):
+        if str(path) == f"{tmp_log_file}.lock":
+            raise PermissionError("lock dir read-only")
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_primary_lock)
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    fallback_path = None
+    try:
+        handler.emit(_make_record("written-with-fallback-lock"))
+        fallback_path = handler._active_lock_path
+        assert fallback_path != handler._lock_path
+        assert fallback_path.startswith(tempfile.gettempdir())
+        assert handler._lock_fd is not None
+        assert "written-with-fallback-lock" in tmp_log_file.read_text()
+    finally:
+        handler.close()
+        if fallback_path and os.path.exists(fallback_path):
+            os.unlink(fallback_path)
+
+    def fail_all_locks(path, flags, mode=0o777, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise OSError("no lock available")
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_all_locks)
+    handler_no_lock = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        assert handler_no_lock._get_lock_fd() is None
+        handler_no_lock.emit(_make_record("written-without-lock"))
+        content = tmp_log_file.read_text()
+        assert "written-with-fallback-lock" in content
+        assert "written-without-lock" in content
+    finally:
+        handler_no_lock.close()
+
+
+def test_process_lock_reopens_when_unlinked_or_replaced(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        handler.emit(_make_record("first"))
+        lock_path = tmp_log_file.with_name("test.log.lock")
+
+        # Unlinking lock file triggers FileNotFoundError re-validation and recreates the lock.
+        os.unlink(lock_path)
+        handler.emit(_make_record("after-unlink"))
+        assert lock_path.exists()
+
+        # Replacing lock file while handler holds the old FD guarantees a new inode and re-validation.
+        old_ino = os.fstat(handler._lock_fd).st_ino
+        os.unlink(lock_path)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        os.close(fd)
+        replaced_ino = lock_path.stat().st_ino
+        assert replaced_ino != old_ino
+
+        handler.emit(_make_record("after-replace"))
+        assert handler._lock_fd is not None
+        assert os.fstat(handler._lock_fd).st_ino == replaced_ino
+
+        content = tmp_log_file.read_text()
+        assert "first" in content
+        assert "after-unlink" in content
+        assert "after-replace" in content
+    finally:
+        handler.close()
+
+
+def test_multiprocess_lock_unlink_recreate_during_rollover(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=300, backupCount=30)
+    lock_path = f"{tmp_log_file}.lock"
+    ctx = multiprocessing.get_context("fork")
+    procs = [ctx.Process(target=_fork_worker, args=(handler, w, 20)) for w in range(4)]
+    try:
+        try:
+            for proc in procs:
+                proc.start()
+            deadline = time.monotonic() + 10
+            while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+                with suppress(FileNotFoundError):
+                    os.unlink(lock_path)
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+                os.close(fd)
+                time.sleep(0.002)
+            for proc in procs:
+                proc.join(timeout=15)
+                assert proc.exitcode == 0
+        finally:
+            _cleanup_processes(procs)
+    finally:
+        handler.close()
+
+    assert (tmp_log_file.parent / "test.log.1").exists()
+    all_lines: list[str] = []
+    for path in tmp_log_file.parent.glob("test.log*"):
+        if path.name != "test.log.lock":
+            all_lines.extend(path.read_text().splitlines())
+
+    expected_lines = {f"worker={w} idx={i} {'x' * 40}" for w in range(4) for i in range(20)}
+    assert len(all_lines) == len(expected_lines)
+    assert set(all_lines) == expected_lines
 
 
 def test_non_posix_fallback_and_emit_error_handling(tmp_log_file, monkeypatch):

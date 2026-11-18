@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
@@ -91,13 +93,26 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             delay=delay,
             errors=errors,
         )
+        self._lock_path = f"{self.baseFilename}.lock"
+        self._active_lock_path = self._lock_path
 
-    def _get_lock_fd(self) -> int:
+    def _get_lock_fd(self) -> int | None:
         pid = os.getpid()
         if self._lock_fd is not None and self._lock_pid != pid:
             self._close_lock_fd()
         if self._lock_fd is None:
-            self._lock_fd = os.open(f"{self.baseFilename}.lock", os.O_CREAT | os.O_RDWR, 0o666)
+            try:
+                fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+                self._active_lock_path = self._lock_path
+            except OSError:
+                digest = hashlib.sha256(self.baseFilename.encode()).hexdigest()[:16]
+                fallback_path = os.path.join(tempfile.gettempdir(), f"simple-logger-{digest}.lock")
+                try:
+                    fd = os.open(fallback_path, os.O_CREAT | os.O_RDWR, 0o666)
+                    self._active_lock_path = fallback_path
+                except OSError:
+                    return None
+            self._lock_fd = fd
             self._lock_pid = pid
         return self._lock_fd
 
@@ -113,8 +128,26 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
         if fcntl is None:
             yield
             return
-        fd = self._get_lock_fd()
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        while True:
+            fd = self._get_lock_fd()
+            if fd is None:
+                yield
+                return
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fd_stat = os.fstat(fd)
+                path_stat = os.stat(self._active_lock_path)
+            except FileNotFoundError:
+                with suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                self._close_lock_fd()
+                continue
+            if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                with suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                self._close_lock_fd()
+                continue
+            break
         try:
             yield
         finally:
@@ -183,17 +216,12 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             for i in range(self.backupCount - 1, 0, -1):
                 sfn = self.rotation_filename(f"{self.baseFilename}.{i}")
                 dfn = self.rotation_filename(f"{self.baseFilename}.{i + 1}")
-                if os.path.exists(sfn):
-                    with suppress(OSError):
-                        if os.path.exists(dfn):
-                            with suppress(FileNotFoundError):
-                                os.remove(dfn)
-                        os.rename(sfn, dfn)
+                with suppress(FileNotFoundError):
+                    os.replace(sfn, dfn)
             dfn = self.rotation_filename(f"{self.baseFilename}.1")
-            with suppress(OSError):
-                if os.path.exists(dfn):
-                    with suppress(FileNotFoundError):
-                        os.remove(dfn)
+            with suppress(FileNotFoundError):
+                if os.name == "nt" and os.path.exists(dfn):
+                    os.remove(dfn)
                 self.rotate(self.baseFilename, dfn)
 
         if not self.delay:
@@ -203,6 +231,15 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
         self.acquire()
         try:
             with self._process_lock():
+                try:
+                    file_stat = os.stat(self.baseFilename)
+                except FileNotFoundError:
+                    file_stat = None
+                if file_stat is None or self.maxBytes <= 0 or file_stat.st_size < self.maxBytes:
+                    self._reopen_if_rotated()
+                    if self.stream is None and not self.delay:
+                        self.stream = self._open()
+                    return
                 self._do_rollover_locked()
         finally:
             self.release()
