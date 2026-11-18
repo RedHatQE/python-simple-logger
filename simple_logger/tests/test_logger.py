@@ -1,6 +1,8 @@
+import errno
 import logging
 import multiprocessing
 import os
+import re
 import stat
 import tempfile
 import time
@@ -121,9 +123,67 @@ def _make_record(msg: str = "hello world", level: int = logging.INFO) -> logging
     )
 
 
-def _fork_worker(handler: MultiProcessRotatingFileHandler, worker_id: int, count: int) -> None:
-    for idx in range(count):
+def _fork_worker(
+    handler: MultiProcessRotatingFileHandler,
+    worker_id: int,
+    count: int,
+    barrier: multiprocessing.synchronize.Barrier | None = None,
+) -> None:
+    for idx in range(count - 1):
         handler.emit(_make_record(f"worker={worker_id} idx={idx} {'x' * 40}"))
+    if barrier is not None:
+        barrier.wait(timeout=10)
+    handler.emit(_make_record(f"worker={worker_id} idx={count - 1} {'x' * 40}"))
+
+
+def _assert_multiprocess_rollover(
+    tmp_log_file,
+    num_workers: int,
+    count: int,
+    max_bytes: int,
+    max_record_len: int,
+) -> list[str]:
+    assert (tmp_log_file.parent / "test.log.1").exists()
+
+    backups: list[tuple[int, object]] = []
+    for path in tmp_log_file.parent.glob("test.log.*"):
+        if path.name == "test.log.lock":
+            continue
+        suffix = path.name.removeprefix("test.log.")
+        if suffix.isdigit():
+            backup_num = int(suffix)
+            backup_size = path.stat().st_size
+            assert max_bytes - max_record_len <= backup_size <= max_bytes
+            backups.append((backup_num, path))
+
+    backups.sort(key=lambda item: item[0], reverse=True)
+    chronological_files = [path for _, path in backups] + [tmp_log_file]
+
+    active_lines = tmp_log_file.read_text().splitlines()
+    backup_lines_by_file = [path.read_text().splitlines() for _, path in backups]
+    for w in range(num_workers):
+        final_line = f"worker={w} idx={count - 1} {'x' * 40}"
+        assert final_line in active_lines
+        for b_lines in backup_lines_by_file:
+            assert final_line not in b_lines
+
+    line_re = re.compile(r"^worker=(\d+) idx=(\d+) ")
+    last_idx: dict[int, int] = {}
+    all_lines: list[str] = []
+    for path in chronological_files:
+        lines = path.read_text().splitlines()
+        all_lines.extend(lines)
+        for line in lines:
+            if line == "parent-init":
+                continue
+            match = line_re.match(line)
+            assert match is not None, f"Unexpected log line: {line!r}"
+            w_id = int(match.group(1))
+            idx = int(match.group(2))
+            assert idx > last_idx.get(w_id, -1)
+            last_idx[w_id] = idx
+
+    return all_lines
 
 
 def _cleanup_processes(procs: list[multiprocessing.process.BaseProcess]) -> None:
@@ -143,8 +203,16 @@ def test_get_logger_uses_multiprocess_handler(tmp_log_file):
     file_handlers[0].close()
 
 
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork start method required",
+)
 def test_multiprocess_fork_and_rollover(tmp_log_file):
-    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=250, backupCount=3)
+    num_workers = 4
+    count = 15
+    max_bytes = 250
+    max_record_len = len(f"worker=3 idx={count - 1} {'x' * 40}\n")
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=max_bytes, backupCount=3)
     try:
         # Open the lock FD in parent before forking to verify child PID reopens its own lock FD.
         handler.emit(_make_record("parent-init"))
@@ -153,7 +221,8 @@ def test_multiprocess_fork_and_rollover(tmp_log_file):
         assert handler._lock_pid == os.getpid()
 
         ctx = multiprocessing.get_context("fork")
-        procs = [ctx.Process(target=_fork_worker, args=(handler, w, 15)) for w in range(4)]
+        barrier = ctx.Barrier(num_workers, timeout=10)
+        procs = [ctx.Process(target=_fork_worker, args=(handler, w, count, barrier)) for w in range(num_workers)]
         try:
             for proc in procs:
                 proc.start()
@@ -168,16 +237,8 @@ def test_multiprocess_fork_and_rollover(tmp_log_file):
     assert handler._lock_fd is None
     assert handler._lock_pid is None
 
-    # Active log + backups should contain valid intact lines and at least one rollover occurred.
-    assert (tmp_log_file.parent / "test.log.1").exists()
-    all_lines: list[str] = []
-    for suffix in ["", ".1", ".2", ".3"]:
-        path = tmp_log_file.parent / f"test.log{suffix}"
-        if path.exists():
-            all_lines.extend(path.read_text().splitlines())
+    all_lines = _assert_multiprocess_rollover(tmp_log_file, num_workers, count, max_bytes, max_record_len)
     assert "parent-init" in all_lines or any("worker=" in line for line in all_lines)
-    for line in all_lines:
-        assert line == "parent-init" or line.startswith("worker=")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows cannot rename or unlink an open log file")
@@ -335,6 +396,7 @@ def test_do_rollover_propagates_oserror_on_rotate(tmp_log_file, monkeypatch):
         handler.close()
 
 
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
 def test_lock_fallback_and_no_lock_preserves_writes(tmp_log_file, monkeypatch):
     real_open = os.open
 
@@ -375,6 +437,7 @@ def test_lock_fallback_and_no_lock_preserves_writes(tmp_log_file, monkeypatch):
         handler_no_lock.close()
 
 
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
 def test_process_lock_reopens_when_unlinked_or_replaced(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
     try:
@@ -406,11 +469,20 @@ def test_process_lock_reopens_when_unlinked_or_replaced(tmp_log_file):
         handler.close()
 
 
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork start method required",
+)
 def test_multiprocess_lock_unlink_recreate_during_rollover(tmp_log_file):
-    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=300, backupCount=30)
+    num_workers = 4
+    count = 20
+    max_bytes = 300
+    max_record_len = len(f"worker=3 idx={count - 1} {'x' * 40}\n")
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=max_bytes, backupCount=30)
     lock_path = f"{tmp_log_file}.lock"
     ctx = multiprocessing.get_context("fork")
-    procs = [ctx.Process(target=_fork_worker, args=(handler, w, 20)) for w in range(4)]
+    barrier = ctx.Barrier(num_workers, timeout=10)
+    procs = [ctx.Process(target=_fork_worker, args=(handler, w, count, barrier)) for w in range(num_workers)]
     try:
         try:
             for proc in procs:
@@ -430,13 +502,8 @@ def test_multiprocess_lock_unlink_recreate_during_rollover(tmp_log_file):
     finally:
         handler.close()
 
-    assert (tmp_log_file.parent / "test.log.1").exists()
-    all_lines: list[str] = []
-    for path in tmp_log_file.parent.glob("test.log*"):
-        if path.name != "test.log.lock":
-            all_lines.extend(path.read_text().splitlines())
-
-    expected_lines = {f"worker={w} idx={i} {'x' * 40}" for w in range(4) for i in range(20)}
+    all_lines = _assert_multiprocess_rollover(tmp_log_file, num_workers, count, max_bytes, max_record_len)
+    expected_lines = {f"worker={w} idx={i} {'x' * 40}" for w in range(num_workers) for i in range(count)}
     assert len(all_lines) == len(expected_lines)
     assert set(all_lines) == expected_lines
 
@@ -463,6 +530,7 @@ def _inspect_lock_fd_in_child(handler: MultiProcessRotatingFileHandler, queue: m
     queue.put((handler._lock_fd, handler._lock_pid))
 
 
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
 def test_close_lock_fds_after_fork_closes_registered_handlers(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
     try:
@@ -514,6 +582,7 @@ def test_idle_forked_child_closes_inherited_lock_fd(tmp_log_file):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX 0o600 permissions do not apply on Windows")
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
 def test_sidecar_lock_file_has_owner_only_permissions(tmp_log_file):
     handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
     try:
@@ -645,3 +714,178 @@ def test_step_and_hash_levels(tmp_log_file):
         for handler in list(log.handlers):
             handler.close()
         logger_module.LOGGERS.pop("test_step_hash_logger", None)
+
+
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_lock_mode_and_primary_sidecar_no_split(tmp_log_file, tmp_path, monkeypatch):
+    fake_tmp = tmp_path / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        os.chmod(tmp_log_file, 0o644)
+        assert handler._lock_mode() == 0o600
+
+        os.chmod(tmp_log_file, 0o660)
+        assert handler._lock_mode() == 0o660
+
+        os.chmod(tmp_log_file, 0o666)
+        assert handler._lock_mode() == 0o666
+
+        # Existing sidecar lock where O_RDWR raises PermissionError falls back to O_RDONLY.
+        lock_path = tmp_log_file.with_name("test.log.lock")
+        lock_path.write_text("")
+        real_open = os.open
+
+        def open_rdwr_denied(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == handler._lock_path and (flags & os.O_RDWR) and not (flags & os.O_CREAT):
+                raise PermissionError("read-only lock")
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_rdwr_denied)
+        fd = handler._get_lock_fd()
+        assert fd is not None
+        assert handler._active_lock_path == handler._lock_path
+        handler.emit(_make_record("rdonly-lock-ok"))
+        assert "rdonly-lock-ok" in tmp_log_file.read_text()
+        handler._close_lock_fd()
+
+        # Existing sidecar lock that cannot be opened at all returns None without opening fallback in tempdir.
+        temp_opens: list[str] = []
+
+        def open_primary_denied(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == handler._lock_path and not (flags & os.O_CREAT):
+                raise PermissionError("cannot open lock")
+            if str(path).startswith(str(fake_tmp)):
+                temp_opens.append(str(path))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_primary_denied)
+        assert handler._get_lock_fd() is None
+        assert temp_opens == []
+        assert list(fake_tmp.iterdir()) == []
+        handler.emit(_make_record("no-split-still-writes"))
+        assert "no-split-still-writes" in tmp_log_file.read_text()
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_secure_fallback_dir_and_file_validation(tmp_log_file, tmp_path, monkeypatch):
+    fake_tmp = tmp_path / "fallback_tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+
+    real_open = os.open
+    real_lstat = os.lstat
+    real_fstat = os.fstat
+
+    def deny_primary_lock(path, flags, mode=0o777, *args, **kwargs):
+        if str(path) == f"{tmp_log_file}.lock":
+            raise PermissionError("primary dir read-only")
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_primary_lock)
+
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        dir_name = f"simple-logger-{uid}" if hasattr(os, "getuid") else "simple-logger"
+        fallback_dir = str(fake_tmp / dir_name)
+
+        def fake_stat_result(st_mode: int, st_uid: int) -> os.stat_result:
+            return os.stat_result((st_mode, 1, 1, 1, st_uid, 0, 0, 0, 0, 0))
+
+        # 1. fallback_dir lstat failures: wrong uid, group/other perms, not a dir.
+        for bad_mode, bad_uid in [
+            (stat.S_IFDIR | 0o700, uid + 1),
+            (stat.S_IFDIR | 0o755, uid),
+            (stat.S_IFLNK | 0o700, uid),
+        ]:
+            monkeypatch.setattr(
+                os,
+                "lstat",
+                lambda p, m=bad_mode, u=bad_uid: fake_stat_result(m, u) if str(p) == fallback_dir else real_lstat(p),
+            )
+            assert handler._get_lock_fd() is None
+
+        monkeypatch.setattr(os, "lstat", real_lstat)
+
+        # 2. fallback_path fstat failures: not a regular file, wrong uid, and OSError.
+        for bad_fstat in [
+            fake_stat_result(stat.S_IFIFO | 0o600, uid),
+            fake_stat_result(stat.S_IFREG | 0o600, uid + 1),
+        ]:
+            monkeypatch.setattr(os, "fstat", lambda _fd, res=bad_fstat: res)
+            assert handler._get_lock_fd() is None
+
+        monkeypatch.setattr(os, "fstat", MagicMock(side_effect=OSError("fstat failed")))
+        assert handler._get_lock_fd() is None
+
+        monkeypatch.setattr(os, "fstat", real_fstat)
+        handler.emit(_make_record("still-writes-after-rejected-fallback"))
+        assert "still-writes-after-rejected-fallback" in tmp_log_file.read_text()
+    finally:
+        handler.close()
+
+
+@pytest.mark.skipif(logger_module.fcntl is None, reason="POSIX fcntl locking required")
+def test_flock_unsupported_and_unexpected_oserror(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=1024, backupCount=2)
+    try:
+        real_flock = logger_module.fcntl.flock
+
+        def flock_eopnotsupp(fd, op):
+            if op == logger_module.fcntl.LOCK_EX:
+                raise OSError(errno.EOPNOTSUPP, "flock unsupported")
+            return real_flock(fd, op)
+
+        monkeypatch.setattr(logger_module.fcntl, "flock", flock_eopnotsupp)
+        handler.emit(_make_record("written-when-flock-unsupported"))
+        assert handler._lock_fd is None
+        assert handler._lock_pid is None
+        assert "written-when-flock-unsupported" in tmp_log_file.read_text()
+
+        def flock_eio(fd, op):
+            if op == logger_module.fcntl.LOCK_EX:
+                raise OSError(errno.EIO, "unexpected io error")
+            return real_flock(fd, op)
+
+        monkeypatch.setattr(logger_module.fcntl, "flock", flock_eio)
+        mock_handle_error = MagicMock()
+        monkeypatch.setattr(handler, "handleError", mock_handle_error)
+        record = _make_record("flock-eio-error")
+        handler.emit(record)
+        mock_handle_error.assert_called_once_with(record)
+        assert "flock-eio-error" not in tmp_log_file.read_text()
+    finally:
+        handler.close()
+
+
+def test_should_rollover_utf16_no_extra_bom(tmp_log_file):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=13, backupCount=2, encoding="utf-16")
+    try:
+        # "a\n" with UTF-16 writes 2-byte BOM + 4 bytes = 6 bytes on disk.
+        handler.emit(_make_record("a"))
+        assert tmp_log_file.stat().st_size == 6
+
+        # "bc\n" is 6 bytes without BOM (total 12 < 13); counting an extra 2-byte BOM would give 14 >= 13.
+        assert handler.shouldRollover(_make_record("bc")) is False
+        handler.maxBytes = 12
+        assert handler.shouldRollover(_make_record("bc")) is True
+    finally:
+        handler.close()
+
+
+def test_should_rollover_crlf_expansion(tmp_log_file, monkeypatch):
+    handler = MultiProcessRotatingFileHandler(filename=tmp_log_file, maxBytes=16, backupCount=2, encoding="utf-8")
+    try:
+        handler.emit(_make_record("ab"))
+        assert tmp_log_file.stat().st_size == 3
+
+        monkeypatch.setattr(os, "linesep", "\r\n")
+        # "1\n2\n3\n4\n5\n" is 10 bytes with LF (3+10=13 < 16), but 15 bytes with CRLF (3+15=18 >= 16).
+        assert handler.shouldRollover(_make_record("1\n2\n3\n4\n5")) is True
+    finally:
+        handler.close()

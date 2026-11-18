@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import codecs
+import errno
 import hashlib
 import logging
 import os
 import re
+import stat
 import tempfile
 import weakref
 from collections.abc import Generator
@@ -24,6 +27,13 @@ LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
 STEP: int = 34
+_UNSUPPORTED_LOCK_ERRNOS: frozenset[int] = frozenset({
+    errno.ENOSYS,
+    errno.EOPNOTSUPP,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+    errno.ENOLCK,
+    errno.EINVAL,
+})
 
 
 class DuplicateFilter(logging.Filter):
@@ -99,22 +109,79 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
         self._active_lock_path = self._lock_path
         _HANDLERS.add(self)
 
+    def _lock_mode(self) -> int:
+        mode = 0o600
+        with suppress(OSError):
+            base_mode = stat.S_IMODE(os.stat(self.baseFilename).st_mode)
+            if base_mode & stat.S_IWGRP:
+                mode |= 0o060
+            if base_mode & stat.S_IWOTH:
+                mode |= 0o006
+        return mode
+
     def _get_lock_fd(self) -> int | None:
         pid = os.getpid()
         if self._lock_fd is not None and self._lock_pid != pid:
             self._close_lock_fd()
         if self._lock_fd is None:
+            lock_mode = self._lock_mode()
+            fd: int | None = None
             try:
-                fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-                self._active_lock_path = self._lock_path
+                for _ in range(3):
+                    try:
+                        fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, lock_mode)
+                    except FileExistsError:
+                        try:
+                            try:
+                                fd = os.open(self._lock_path, os.O_RDWR)
+                            except PermissionError:
+                                fd = os.open(self._lock_path, os.O_RDONLY)
+                        except FileNotFoundError:
+                            continue
+                    else:
+                        if hasattr(os, "fchmod"):
+                            with suppress(OSError):
+                                os.fchmod(fd, lock_mode)
+                    self._active_lock_path = self._lock_path
+                    break
             except OSError:
+                if os.path.exists(self._lock_path):
+                    return None
+                fd = None
+
+            if fd is None:
+                if os.path.exists(self._lock_path):
+                    return None
                 digest = hashlib.sha256(self.baseFilename.encode()).hexdigest()[:16]
-                fallback_path = os.path.join(tempfile.gettempdir(), f"simple-logger-{digest}.lock")
+                uid = os.getuid() if hasattr(os, "getuid") else None
+                dir_name = f"simple-logger-{uid}" if uid is not None else "simple-logger"
+                fallback_dir = os.path.join(tempfile.gettempdir(), dir_name)
                 try:
-                    fd = os.open(fallback_path, os.O_CREAT | os.O_RDWR, 0o600)
-                    self._active_lock_path = fallback_path
+                    os.makedirs(fallback_dir, mode=0o700, exist_ok=True)
+                    d_st = os.lstat(fallback_dir)
+                    if (
+                        not stat.S_ISDIR(d_st.st_mode)
+                        or (uid is not None and d_st.st_uid != uid)
+                        or (d_st.st_mode & 0o077) != 0
+                    ):
+                        return None
+                    fallback_path = os.path.join(fallback_dir, f"{digest}.lock")
+                    no_follow = getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(fallback_path, os.O_CREAT | os.O_RDWR | no_follow, 0o600)
                 except OSError:
                     return None
+                try:
+                    f_st = os.fstat(fd)
+                    if not stat.S_ISREG(f_st.st_mode) or (uid is not None and f_st.st_uid != uid):
+                        with suppress(OSError):
+                            os.close(fd)
+                        return None
+                except OSError:
+                    with suppress(OSError):
+                        os.close(fd)
+                    return None
+                self._active_lock_path = fallback_path
+
             self._lock_fd = fd
             self._lock_pid = pid
         return self._lock_fd
@@ -136,7 +203,14 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             if fd is None:
                 yield
                 return
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                if exc.errno in _UNSUPPORTED_LOCK_ERRNOS:
+                    self._close_lock_fd()
+                    yield
+                    return
+                raise
             try:
                 fd_stat = os.fstat(fd)
                 path_stat = os.stat(self._active_lock_path)
@@ -191,7 +265,14 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             if not encoding or encoding == "locale":
                 stream_encoding = getattr(self.stream, "encoding", None)
                 encoding = stream_encoding if isinstance(stream_encoding, str) else "utf-8"
-            msg_bytes = len((msg + self.terminator).encode(encoding, self.errors or "replace"))
+            line = f"{msg}{self.terminator}"
+            if os.linesep != "\n":
+                line = line.replace("\n", os.linesep)
+            encoder = codecs.getincrementalencoder(encoding)(self.errors or "replace")
+            if size > 0:
+                with suppress(UnicodeEncodeError):
+                    encoder.encode("0")
+            msg_bytes = len(encoder.encode(line))
             if size + msg_bytes >= self.maxBytes:
                 return True
         return False
