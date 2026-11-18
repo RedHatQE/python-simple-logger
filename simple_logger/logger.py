@@ -31,7 +31,6 @@ _UNSUPPORTED_LOCK_ERRNOS: frozenset[int] = frozenset({
     errno.ENOSYS,
     errno.EOPNOTSUPP,
     getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
-    errno.ENOLCK,
     errno.EINVAL,
 })
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 import logging
 import multiprocessing
@@ -1104,18 +1106,20 @@ def test_flock_unsupported_and_unexpected_oserror(tmp_log_file, monkeypatch):
         assert handler._lock_pid is None
         assert "written-when-flock-unsupported" in tmp_log_file.read_text()
 
-        def flock_eio(fd, op):
-            if op == logger_module.fcntl.LOCK_EX:
-                raise OSError(errno.EIO, "unexpected io error")
-            return real_flock(fd, op)
+        for err_no, err_msg in ((errno.EIO, "unexpected io error"), (errno.ENOLCK, "lock limit exhausted")):
 
-        monkeypatch.setattr(logger_module.fcntl, "flock", flock_eio)
-        mock_handle_error = MagicMock()
-        monkeypatch.setattr(handler, "handleError", mock_handle_error)
-        record = _make_record("flock-eio-error")
-        handler.emit(record)
-        mock_handle_error.assert_called_once_with(record)
-        assert "flock-eio-error" not in tmp_log_file.read_text()
+            def flock_err(fd, op, _err_no=err_no, _err_msg=err_msg):
+                if op == logger_module.fcntl.LOCK_EX:
+                    raise OSError(_err_no, _err_msg)
+                return real_flock(fd, op)
+
+            monkeypatch.setattr(logger_module.fcntl, "flock", flock_err)
+            mock_handle_error = MagicMock()
+            monkeypatch.setattr(handler, "handleError", mock_handle_error)
+            record = _make_record(f"flock-error-{err_no}")
+            handler.emit(record)
+            mock_handle_error.assert_called_once_with(record)
+            assert f"flock-error-{err_no}" not in tmp_log_file.read_text()
     finally:
         handler.close()
 
