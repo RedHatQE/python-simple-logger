@@ -23,6 +23,15 @@ try:
 except ImportError:
     fcntl = None
 
+grp: Any
+pwd: Any
+try:
+    import grp
+    import pwd
+except ImportError:
+    grp = None
+    pwd = None
+
 LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
 HASH: int = 33
@@ -33,6 +42,28 @@ _UNSUPPORTED_LOCK_ERRNOS: frozenset[int] = frozenset({
     getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
     errno.EINVAL,
 })
+
+
+def _is_trusted_owner(
+    st_uid: int,
+    current_uid: int | None,
+    base_uid: int | None,
+    base_gid: int | None,
+    *,
+    group_shared: bool,
+) -> bool:
+    if current_uid is None or st_uid == current_uid:
+        return True
+    if not group_shared:
+        return False
+    if base_uid is not None and st_uid == base_uid:
+        return True
+    if base_gid is not None and pwd is not None and grp is not None:
+        with suppress(KeyError):
+            pw_entry = pwd.getpwuid(st_uid)
+            if pw_entry.pw_gid == base_gid or pw_entry.pw_name in grp.getgrgid(base_gid).gr_mem:
+                return True
+    return False
 
 
 class DuplicateFilter(logging.Filter):
@@ -80,7 +111,13 @@ class WrapperLogFormatter(ColoredFormatter):
 
 
 class MultiProcessRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler safe for concurrent writes and rotations across processes."""
+    """RotatingFileHandler safe for concurrent writes and rotations across processes.
+
+    Note:
+        Pre-existing primary sidecar lock file (``<filename>.lock``) ACLs must match
+        or be updated alongside log file ACL changes when adding new group writers;
+        the sidecar owner automatically syncs the sidecar ACL on lock acquisition.
+    """
 
     def __init__(
         self,
@@ -94,6 +131,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
     ) -> None:
         self._lock_fd: int | None = None
         self._lock_pid: int | None = None
+        self._cached_acl: tuple[int, int | None, int | None] | None = None
         super().__init__(
             filename=filename,
             mode=mode,
@@ -109,19 +147,29 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
         _HANDLERS.add(self)
 
     def _log_acl(self) -> tuple[int, int | None, int | None]:
-        mode = 0o600
-        base_uid: int | None = None
-        base_gid: int | None = None
-        with suppress(OSError):
+        base_stat: os.stat_result | None = None
+        try:
             base_stat = os.stat(self.baseFilename)
+        except OSError:
+            if self.stream is not None:
+                with suppress(OSError, ValueError):
+                    base_stat = os.fstat(self.stream.fileno())
+
+        if base_stat is not None:
+            mode = 0o600
             base_mode = stat.S_IMODE(base_stat.st_mode)
             if base_mode & stat.S_IWGRP:
                 mode |= 0o060
             if base_mode & stat.S_IWOTH:
                 mode |= 0o006
-            base_uid = base_stat.st_uid
-            base_gid = base_stat.st_gid
-        return mode, base_uid, base_gid
+            acl: tuple[int, int | None, int | None] = (mode, base_stat.st_uid, base_stat.st_gid)
+            self._cached_acl = acl
+            return acl
+
+        if self._cached_acl is not None:
+            return self._cached_acl
+
+        return (0o600, None, None)
 
     def _lock_mode(self) -> int:
         return self._log_acl()[0]
@@ -166,11 +214,9 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
 
         if not stat.S_ISDIR(d_st.st_mode) or (d_st.st_mode & perm_mask) != 0:
             return None
-        allowed_uids = {u for u in (uid, base_uid) if u is not None}
-        if shared_gid is not None:
-            if d_st.st_gid != shared_gid or (uid is not None and d_st.st_uid not in allowed_uids):
-                return None
-        elif uid is not None and d_st.st_uid != uid:
+        if shared_gid is not None and d_st.st_gid != shared_gid:
+            return None
+        if not _is_trusted_owner(d_st.st_uid, uid, base_uid, shared_gid, group_shared=shared_gid is not None):
             return None
 
         no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -196,16 +242,11 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
 
         try:
             f_st = os.fstat(fd)
-            if not stat.S_ISREG(f_st.st_mode):
-                with suppress(OSError):
-                    os.close(fd)
-                return None
-            if shared_gid is not None:
-                if f_st.st_gid != shared_gid or (uid is not None and f_st.st_uid not in allowed_uids):
-                    with suppress(OSError):
-                        os.close(fd)
-                    return None
-            elif uid is not None and f_st.st_uid != uid:
+            if (
+                not stat.S_ISREG(f_st.st_mode)
+                or (shared_gid is not None and f_st.st_gid != shared_gid)
+                or not _is_trusted_owner(f_st.st_uid, uid, base_uid, shared_gid, group_shared=shared_gid is not None)
+            ):
                 with suppress(OSError):
                     os.close(fd)
                 return None
@@ -266,6 +307,24 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
             self._lock_pid = pid
         return self._lock_fd
 
+    def _sync_primary_lock_acl(self, fd: int) -> None:
+        if self._active_lock_path != self._lock_path:
+            return
+        lock_mode, _base_uid, base_gid = self._log_acl()
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        try:
+            f_st = os.fstat(fd)
+        except OSError:
+            return
+        needs_group = bool((lock_mode & 0o060) and base_gid is not None and f_st.st_gid != base_gid)
+        if (uid is None or f_st.st_uid == uid) and (stat.S_IMODE(f_st.st_mode) != lock_mode or needs_group):
+            if (lock_mode & 0o060) and base_gid is not None and hasattr(os, "fchown"):
+                with suppress(OSError):
+                    os.fchown(fd, -1, base_gid)
+            if hasattr(os, "fchmod"):
+                with suppress(OSError):
+                    os.fchmod(fd, lock_mode)
+
     def _close_lock_fd(self) -> None:
         if self._lock_fd is not None:
             with suppress(OSError):
@@ -281,8 +340,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
         while True:
             fd = self._get_lock_fd()
             if fd is None:
-                yield
-                return
+                raise OSError(f"Unable to acquire lock for rotating log {self.baseFilename}")
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
             except OSError as exc:
@@ -306,6 +364,7 @@ class MultiProcessRotatingFileHandler(RotatingFileHandler):
                 continue
             break
         try:
+            self._sync_primary_lock_acl(fd)
             yield
         finally:
             with suppress(OSError):
