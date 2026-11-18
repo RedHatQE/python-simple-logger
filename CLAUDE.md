@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Testing
 
 ```bash
-# Run tests across all Python versions (3.9, 3.10, 3.11, 3.12, 3.13)
+# Run tests across all Python versions (3.10, 3.11, 3.12, 3.13, 3.14)
 tox
 
 # Run tests for current environment only

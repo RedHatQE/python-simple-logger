@@ -3,11 +3,19 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from colorlog import ColoredFormatter
+
+fcntl: Any
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 LOGGERS: dict[str, logging.Logger] = {}
 SUCCESS: int = 32
@@ -57,6 +65,166 @@ class RedactingFilter(logging.Filter):
 class WrapperLogFormatter(ColoredFormatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         return datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+
+
+class MultiProcessRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler safe for concurrent writes and rotations across processes."""
+
+    def __init__(
+        self,
+        filename: str | os.PathLike[str],
+        mode: str = "a",
+        maxBytes: int = 0,
+        backupCount: int = 0,
+        encoding: str | None = None,
+        delay: bool = False,
+        errors: str | None = None,
+    ) -> None:
+        self._lock_fd: int | None = None
+        self._lock_pid: int | None = None
+        super().__init__(
+            filename=filename,
+            mode=mode,
+            maxBytes=maxBytes,
+            backupCount=backupCount,
+            encoding=encoding,
+            delay=delay,
+            errors=errors,
+        )
+
+    def _get_lock_fd(self) -> int:
+        pid = os.getpid()
+        if self._lock_fd is not None and self._lock_pid != pid:
+            self._close_lock_fd()
+        if self._lock_fd is None:
+            self._lock_fd = os.open(f"{self.baseFilename}.lock", os.O_CREAT | os.O_RDWR, 0o666)
+            self._lock_pid = pid
+        return self._lock_fd
+
+    def _close_lock_fd(self) -> None:
+        if self._lock_fd is not None:
+            with suppress(OSError):
+                os.close(self._lock_fd)
+            self._lock_fd = None
+            self._lock_pid = None
+
+    @contextmanager
+    def _process_lock(self) -> Generator[None, None, None]:
+        if fcntl is None:
+            yield
+            return
+        fd = self._get_lock_fd()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+
+    def _reopen_if_rotated(self) -> None:
+        if self.stream is None:
+            return
+        try:
+            stream_stat = os.fstat(self.stream.fileno())
+        except (OSError, ValueError):
+            return
+        try:
+            file_stat = os.stat(self.baseFilename)
+            rotated = (stream_stat.st_dev, stream_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino)
+        except FileNotFoundError:
+            rotated = True
+        if rotated:
+            try:
+                self.stream.close()
+            finally:
+                self.stream = None
+            self.stream = self._open()
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        self._reopen_if_rotated()
+        if self.stream is None:
+            self.stream = self._open()
+        if self.maxBytes > 0:
+            size = os.fstat(self.stream.fileno()).st_size
+            if not size:
+                return False
+            if os.path.exists(self.baseFilename) and not os.path.isfile(self.baseFilename):
+                return False
+            if size + len(f"{self.format(record)}\n") >= self.maxBytes:
+                return True
+        return False
+
+    def _do_rollover_locked(self) -> None:
+        stream_id: tuple[int, int] | None = None
+        if self.stream is not None:
+            try:
+                st = os.fstat(self.stream.fileno())
+                stream_id = (st.st_dev, st.st_ino)
+            except (OSError, ValueError):
+                pass
+            try:
+                self.stream.close()
+            finally:
+                self.stream = None
+
+        try:
+            file_stat = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            if not self.delay:
+                self.stream = self._open()
+            return
+
+        if (stream_id is not None and (file_stat.st_dev, file_stat.st_ino) != stream_id) or file_stat.st_size == 0:
+            if not self.delay:
+                self.stream = self._open()
+            return
+
+        if self.backupCount > 0:
+            for i in range(self.backupCount - 1, 0, -1):
+                sfn = self.rotation_filename(f"{self.baseFilename}.{i}")
+                dfn = self.rotation_filename(f"{self.baseFilename}.{i + 1}")
+                if os.path.exists(sfn):
+                    with suppress(OSError):
+                        if os.path.exists(dfn):
+                            with suppress(FileNotFoundError):
+                                os.remove(dfn)
+                        os.rename(sfn, dfn)
+            dfn = self.rotation_filename(f"{self.baseFilename}.1")
+            with suppress(OSError):
+                if os.path.exists(dfn):
+                    with suppress(FileNotFoundError):
+                        os.remove(dfn)
+                self.rotate(self.baseFilename, dfn)
+
+        if not self.delay:
+            self.stream = self._open()
+
+    def doRollover(self) -> None:
+        self.acquire()
+        try:
+            with self._process_lock():
+                self._do_rollover_locked()
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            with self._process_lock():
+                if self.shouldRollover(record):
+                    self._do_rollover_locked()
+                logging.FileHandler.emit(self, record)
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
+
+    def close(self) -> None:
+        self.acquire()
+        try:
+            try:
+                super().close()
+            finally:
+                self._close_lock_fd()
+        finally:
+            self.release()
 
 
 class SimpleLogger(logging.getLoggerClass()):  # type: ignore[misc]
@@ -158,7 +326,9 @@ def get_logger(
         logger_obj.addFilter(filter=RedactingFilter(patterns=mask_sensitive_patterns))
 
     if filename:
-        log_handler = RotatingFileHandler(filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count)
+        log_handler = MultiProcessRotatingFileHandler(
+            filename=filename, maxBytes=file_max_bytes, backupCount=file_backup_count
+        )
         log_handler.setFormatter(fmt=log_formatter)
         log_handler.setLevel(level=level)
         logger_obj.addHandler(hdlr=log_handler)
