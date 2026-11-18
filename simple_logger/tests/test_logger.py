@@ -736,7 +736,7 @@ def test_emit_formats_outside_process_lock(tmp_log_file: Path, monkeypatch: pyte
         orig_process_lock = handler._process_lock
 
         @contextmanager
-        def tracking_lock() -> Generator[None, None, None]:
+        def tracking_lock() -> Generator[None]:
             nonlocal in_lock
             with orig_process_lock():
                 in_lock = True
